@@ -15,18 +15,27 @@
 # This file is a part of the vllm-ascend project.
 #
 
-FROM quay.io/ascend/cann:9.1.0-beta.1-310p-openeuler24.03-py3.12
+ARG CANN_IMAGE=quay.io/ascend/cann:9.1.0-beta.1-310p-openeuler24.03-py3.12
+FROM ${CANN_IMAGE}
 
+ARG APTMIRROR=""
 ARG PIP_INDEX_URL="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+ARG PYTORCH_INDEX_URL="https://download.pytorch.org/whl/cpu/"
 
 WORKDIR /workspace
 
-RUN yum update -y && \
+RUN if [ -n "$APTMIRROR" ]; then \
+      sed -Ei "s@https?://[^/]+/(openeuler|centos|fedora)@${APTMIRROR}/\1@g" /etc/yum.repos.d/*.repo; \
+    fi && \
+    yum update -y && \
     yum install -y python3-pip git vim wget net-tools gcc gcc-c++ make cmake numactl numactl-devel jemalloc patch && \
     rm -rf /var/cache/yum
 
 # Install modelscope (for fast download) and ray (for multinode)
-RUN pip config set global.index-url ${PIP_INDEX_URL} && \
+RUN pip config set global.index-url "${PIP_INDEX_URL}" && \
+    if [ "${PIP_INDEX_URL#http://}" != "${PIP_INDEX_URL}" ]; then \
+      pip config set global.trusted-host "$(printf '%s' "${PIP_INDEX_URL}" | awk -F/ '{print $3}')"; \
+    fi && \
     python3 -m pip install modelscope 'ray>=2.47.1,<=2.48.0' 'protobuf>3.20.0' && \
     python3 -m pip cache purge
 
@@ -42,7 +51,7 @@ RUN if [ -n "$VLLM_COMMIT" ]; then \
       git clone --depth 1 -b $VLLM_TAG $VLLM_REPO /vllm-workspace/vllm; \
     fi
 # In x86, triton will be installed by vllm. But in Ascend, triton doesn't work correctly. we need to uninstall it.
-RUN VLLM_TARGET_DEVICE="empty" python3 -m pip install -e /vllm-workspace/vllm/[audio] --extra-index https://download.pytorch.org/whl/cpu/ && \
+RUN VLLM_TARGET_DEVICE="empty" python3 -m pip install -e /vllm-workspace/vllm/[audio] --extra-index-url "${PYTORCH_INDEX_URL}" && \
     python3 -m pip uninstall -y triton && \
     python3 -m pip cache purge
 
@@ -57,7 +66,7 @@ COPY . /vllm-workspace/vllm-ascend/
 RUN export PIP_EXTRA_INDEX_URL="https://mirrors.huaweicloud.com/ascend/repos/pypi" && \
     source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
     source /usr/local/Ascend/nnal/atb/set_env.sh && \
-    python3 -m pip install -e /vllm-workspace/vllm-ascend/ --extra-index https://download.pytorch.org/whl/cpu/ && \
+    python3 -m pip install -e /vllm-workspace/vllm-ascend/ --extra-index-url "${PYTORCH_INDEX_URL}" && \
     python3 -m pip uninstall -y triton-ascend triton && \
     python3 -m pip cache purge
 

@@ -15,12 +15,12 @@ on:
         description: 'The Dockerfile to use'
         required: false
         type: string
+      image:
+        description: 'Container image used for the BuildKit job and Dockerfile CANN base'
+        required: true
+        type: string
       quay_username:
         description: 'Quay username for pushing images'
-        required: false
-        type: string
-      quay_temp_username:
-        description: 'Quay username for pushing temp tag digests'
         required: false
         type: string
       workflow_dispatch_tag:
@@ -58,41 +58,42 @@ on:
         type: boolean
         default: false
     secrets:
-        QUAY_PASSWORD:
-            description: 'Quay password for pushing images'
-            required: false
-        QUAY_TEMP_PASSWORD:
-            description: 'Quay password for pushing temp tag digests'
+        QUAY_TOKEN:
+            description: 'Quay token for pushing images'
             required: false
 
 env:
-  QUAY_REPO: quay.io/ascend/vllm-ascend
-  QUAY_TEMP_REPO: quay.io/atlas-ci/vllm-atlas-temp
-  CACHE_REPO: ghcr.io/vllm-project/vllm-ascend
+  QUAY_REPO: quay.io/atlas-ci/vllm-atlas-day0
+  QUAY_TEMP_REPO: quay.io/atlas-ci/vllm-atlas-day0
+  CACHE_REPO: quay.io/atlas-ci/vllm-atlas-day0
 
 jobs:
   build-push-digest:
     name: build
     runs-on: ${{ matrix.runner }}
+    container:
+      image: ${{ inputs.image }}
     permissions:
       packages: write
       contents: read
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - arch: linux/amd64
-            runner: ubuntu-latest
+            runner: linux-amd64-cpu-4-buildkit
             tag: amd64
 
           - arch: linux/arm64
-            runner: ubuntu-22.04-arm
+            runner: linux-aarch64-cpu-4-buildkit
             tag: arm64
 
     steps:
 
     - name: Validate inputs (workflow_dispatch only)
       if: ${{ github.event_name == 'workflow_dispatch' }}
+      shell: bash -e {0}
       run: |
         tag="${{ inputs.workflow_dispatch_tag }}"
         branch="${{ inputs.branch_ref }}"
@@ -157,37 +158,92 @@ jobs:
       if: ${{ github.event_name == 'workflow_dispatch' && inputs.workflow_dispatch_tag == '' && inputs.vllm_ascend_commit == '' }}
       with:
         submodules: recursive
-        fetch-depth: 0
+        fetch-depth: 1
         persist-credentials: false
         ref: ${{ inputs.branch_ref }}
 
-    - name: Free up disk space
-      uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
-      with:
-        tool-cache: true
-        docker-images: false
+    - name: Validate BuildKit runner environment
+      shell: bash -e {0}
+      timeout-minutes: 2
+      run: |
+        : "${BUILDKITD_ADDR:?BUILDKITD_ADDR is not set on the runner}"
+        : "${DOCKER_CONFIG:?DOCKER_CONFIG is not set on the runner}"
 
-    - name: Publish - Login to Quay Temp (for pushing temp tag digest)
+        if ! command -v buildctl >/dev/null 2>&1; then
+          echo "Error: buildctl is not available in the job container."
+          exit 1
+        fi
+
+        for file in ca.pem cert.pem key.pem; do
+          if [ ! -r "${DOCKER_CONFIG}/${file}" ]; then
+            echo "Error: required BuildKit TLS file is not readable: ${DOCKER_CONFIG}/${file}"
+            exit 1
+          fi
+        done
+
+        buildctl \
+          --addr="${BUILDKITD_ADDR}" \
+          --tlscacert="${DOCKER_CONFIG}/ca.pem" \
+          --tlscert="${DOCKER_CONFIG}/cert.pem" \
+          --tlskey="${DOCKER_CONFIG}/key.pem" \
+          debug workers --verbose
+
+    - name: Diagnose BuildKit RUN executor
+      shell: bash -e {0}
+      timeout-minutes: 10
+      env:
+        CANN_IMAGE: ${{ inputs.image }}
+        ARCH: ${{ matrix.arch }}
+      run: |
+        : "${BUILDKITD_ADDR:?BUILDKITD_ADDR is not set on the runner}"
+        : "${DOCKER_CONFIG:?DOCKER_CONFIG is not set on the runner}"
+
+        SMOKE_DIR="${RUNNER_TEMP}/buildkit-run-smoke"
+        mkdir -p "${SMOKE_DIR}"
+        printf '%s\n' \
+          'ARG CANN_IMAGE' \
+          'FROM ${CANN_IMAGE}' \
+          'RUN ["/bin/true"]' \
+          'RUN ["/bin/bash", "-c", "echo BUILDKIT_BASH_STARTED"]' \
+          > "${SMOKE_DIR}/Dockerfile"
+
+        buildctl \
+          --addr="${BUILDKITD_ADDR}" \
+          --tlscacert="${DOCKER_CONFIG}/ca.pem" \
+          --tlscert="${DOCKER_CONFIG}/cert.pem" \
+          --tlskey="${DOCKER_CONFIG}/key.pem" \
+          build \
+          --frontend dockerfile.v0 \
+          --local "context=${SMOKE_DIR}" \
+          --local "dockerfile=${SMOKE_DIR}" \
+          --opt filename=Dockerfile \
+          --opt "platform=${ARCH}" \
+          --opt "build-arg:CANN_IMAGE=${CANN_IMAGE}" \
+          --no-cache \
+          --progress=plain
+
+    - name: Configure registry credentials
       if: ${{ inputs.should_push }}
-      uses: docker/login-action@v4
-      with:
-        registry: quay.io
-        username: ${{ inputs.quay_temp_username }}
-        password: ${{ secrets.QUAY_TEMP_PASSWORD }}
+      shell: bash -e {0}
+      env:
+        QUAY_USER: ${{ inputs.quay_username }}
+        QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
+      run: |
+        : "${DOCKER_CONFIG:?DOCKER_CONFIG is not set on the runner}"
+        : "${QUAY_USER:?quay_username is not configured}"
+        : "${QUAY_TOKEN:?QUAY_TOKEN is not configured}"
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v4
-      with:
-        install: true
-        driver: docker-container
-        use: true
-
-    - name: Login to GitHub Container Registry (for cache)
-      uses: docker/login-action@v4
-      with:
-        registry: ghcr.io
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+        BUILDKIT_TLS_DIR="${DOCKER_CONFIG}"
+        REGISTRY_CONFIG_DIR="${RUNNER_TEMP}/buildkit-docker-config"
+        umask 077
+        mkdir -p "${REGISTRY_CONFIG_DIR}"
+        QUAY_AUTH=$(printf '%s:%s' "${QUAY_USER}" "${QUAY_TOKEN}" | base64 | tr -d '\n')
+        printf '{"auths":{"quay.io":{"auth":"%s"}}}\n' "${QUAY_AUTH}" \
+          > "${REGISTRY_CONFIG_DIR}/config.json"
+        {
+          echo "BUILDKIT_TLS_DIR=${BUILDKIT_TLS_DIR}"
+          echo "DOCKER_CONFIG=${REGISTRY_CONFIG_DIR}"
+        } >> "${GITHUB_ENV}"
 
     - name: Compute cache tag
       id: cache-tag
@@ -207,9 +263,10 @@ jobs:
 
     - name: Get Dockerfile base image tag
       id: get_base_image_tag
+      env:
+        CANN_IMAGE: ${{ inputs.image }}
       run: |
-        DOCKERFILE="${{ inputs.dockerfile || 'Dockerfile' }}"
-        BASE_IMAGE_TAG=$(grep -m1 '^FROM' "$DOCKERFILE" | awk -F: '{print $NF}')
+        BASE_IMAGE_TAG="${CANN_IMAGE##*:}"
         echo "BASE_IMAGE_TAG=$BASE_IMAGE_TAG" >> $GITHUB_OUTPUT
         
     - name: Get architecture
@@ -235,214 +292,91 @@ jobs:
 
 
     - name: Build and push
-      uses: docker/build-push-action@v7
       id: build
-      with:
-        platforms: ${{ matrix.arch }}
-        # use the current repo path as the build context, ensure .git is contained
-        context: .
-        file: ${{ inputs.dockerfile || 'Dockerfile' }}
-        # only trigger when tag, branch/main push
-        push: ${{ inputs.should_push }}
-        outputs: type=image,name=${{ env.QUAY_TEMP_REPO }},push-by-digest=true,name-canonical=true,push=${{ inputs.should_push }}
-        build-args: |
-          PIP_INDEX_URL=https://pypi.org/simple
-          COMPILE_CUSTOM_KERNELS=${{ steps.cache-csrc.outputs.cache-hit == 'true' && '0' || '1' }}
-          VLLM_COMMIT=${{ inputs.vllm_commit }}
-        provenance: false
-        # To speed up the build, we use registry cache. The cache tag is determined by the suffix and architecture, and shared across different workflow runs.
-        # For example, the cache tag for arm64 image with suffix "openeuler" will be "buildcache-openeuler-arm64".
-        # When a new image is built and pushed, the cache will also be updated in the registry, so that next build can benefit from it.
-        cache-from: type=registry,ref=${{ env.CACHE_REPO }}:${{ steps.cache-tag.outputs.value }}
-        cache-to: ${{ inputs.should_push && format('type=registry,ref={0}:{1},mode=max', env.CACHE_REPO, steps.cache-tag.outputs.value) || '' }}
-
-    # Quay.io automatically cleans up untagged digests on a regular basis, with a cycle of approximately one hour. 
-    # Add temporary tags to digests to prevent them from being removed.
-    - name: Tag digest to prevent GC
-      if: ${{ inputs.should_push }}
+      shell: bash -e {0}
+      env:
+        DOCKERFILE: ${{ inputs.dockerfile || 'Dockerfile' }}
+        ARCH: ${{ matrix.arch }}
+        MATRIX_TAG: ${{ matrix.tag }}
+        SUFFIX_INPUT: ${{ inputs.suffix }}
+        SCHEDULE_TAG_PATTERN: ${{ inputs.schedule_tag_pattern }}
+        TEMP_ONLY: ${{ inputs.temp_only }}
+        VLLM_COMMIT_INPUT: ${{ inputs.vllm_commit }}
+        VLLM_ASCEND_COMMIT_INPUT: ${{ inputs.vllm_ascend_commit }}
+        COMPILE_CUSTOM_KERNELS: ${{ steps.cache-csrc.outputs.cache-hit == 'true' && '0' || '1' }}
+        VLLM_COMMIT: ${{ inputs.vllm_commit }}
+        CANN_IMAGE: ${{ inputs.image }}
+        APTMIRROR: http://cache-service.nginx-pypi-cache.svc.cluster.local:8081
+        PIP_INDEX_URL: http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
+        PYTORCH_INDEX_URL: http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu/
+        SHOULD_PUSH: ${{ inputs.should_push }}
+        QUAY_TEMP_REPO: ${{ env.QUAY_TEMP_REPO }}
+        CACHE_REPO: ${{ env.CACHE_REPO }}
+        CACHE_TAG: ${{ steps.cache-tag.outputs.value }}
       run: |
-        SUFFIX=""
-        if [ -n "${{ inputs.suffix }}" ]; then
-          SUFFIX="-${{ inputs.suffix }}"
-        fi
-        if [ "${{ inputs.temp_only }}" = "true" ]; then
-          VLLM_SHORT=$(echo "${{ inputs.vllm_commit }}" | cut -c1-7)
-          ASCEND_SHORT=$(echo "${{ inputs.vllm_ascend_commit }}" | cut -c1-7)
-          TAG="vllm-ascend-${VLLM_SHORT}-${ASCEND_SHORT}${SUFFIX}-${{ matrix.tag }}-temp"
-        else
-          TAG="nightly-${{ inputs.schedule_tag_pattern }}${SUFFIX}-${{ matrix.tag }}-temp"
-        fi
-        echo "Creating temp tag: ${{ env.QUAY_TEMP_REPO }}:$TAG"
-        docker buildx imagetools create \
-          -t "${{ env.QUAY_TEMP_REPO }}:$TAG" \
-          "${{ env.QUAY_TEMP_REPO }}@${{ steps.build.outputs.digest }}"
+        : "${BUILDKITD_ADDR:?BUILDKITD_ADDR is not set on the runner}"
+        : "${DOCKER_CONFIG:?DOCKER_CONFIG is not set on the runner}"
+        TLS_CONFIG_DIR="${BUILDKIT_TLS_DIR:-${DOCKER_CONFIG}}"
 
+        BUILD_ARGS=(
+          --frontend dockerfile.v0
+          --local context=.
+          --local dockerfile=.
+          --opt "filename=${DOCKERFILE}"
+          --opt "platform=${ARCH}"
+          --opt "build-arg:CANN_IMAGE=${CANN_IMAGE}"
+          --opt "build-arg:APTMIRROR=${APTMIRROR}"
+          --opt "build-arg:PIP_INDEX_URL=${PIP_INDEX_URL}"
+          --opt "build-arg:PYTORCH_INDEX_URL=${PYTORCH_INDEX_URL}"
+          --opt "build-arg:COMPILE_CUSTOM_KERNELS=${COMPILE_CUSTOM_KERNELS}"
+          --opt "build-arg:VLLM_COMMIT=${VLLM_COMMIT}"
+          --import-cache "type=registry,ref=${CACHE_REPO}:${CACHE_TAG}"
+          --metadata-file /tmp/metadata.json
+          --progress=plain
+        )
 
-    - name: Export digest
-      run: |
-        mkdir -p ${{ runner.temp }}/digests
-        digest="${{ steps.build.outputs.digest }}"
-        touch "${{ runner.temp }}/digests/${digest#sha256:}"
-
-    - name: Upload digest
-      uses: actions/upload-artifact@v7
-      with:
-        name: ${{ inputs.artifact_prefix }}-${{ inputs.suffix }}-${{ matrix.tag }}
-        path: ${{ runner.temp }}/digests/*
-        if-no-files-found: error
-        retention-days: 1
-
-
-  merge-image:
-    runs-on: ubuntu-latest
-    needs: build-push-digest
-    if: ${{ inputs.should_push && !inputs.temp_only }}
-    steps:
-      - name: Checkout branch
-        uses: actions/checkout@v7
-        if: ${{ github.event_name != 'workflow_dispatch' || (github.event_name == 'workflow_dispatch' && inputs.workflow_dispatch_tag == '') }}
-        with:
-          submodules: recursive
-          ref: ${{ inputs.branch_ref }}
-
-      - name: Checkout tag
-        uses: actions/checkout@v7
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.workflow_dispatch_tag != '' }}
-        with:
-          submodules: recursive
-          ref: ${{ inputs.workflow_dispatch_tag }}
-
-      - name: Download arm64 digests
-        uses: actions/download-artifact@v8
-        with:
-          path: ${{ runner.temp }}/digests
-          pattern: ${{ inputs.artifact_prefix }}-${{ inputs.suffix }}-arm64
-          merge-multiple: true
-
-      - name: Download amd64 digests
-        uses: actions/download-artifact@v8
-        with:
-          path: ${{ runner.temp }}/digests
-          pattern: ${{ inputs.artifact_prefix }}-${{ inputs.suffix }}-amd64
-          merge-multiple: true
-
-      - name: Prepare suffix
-        id: suffix
-        run: |
-          # Prepend '-' to suffix so Docker metadata action can append it directly
-          # to the tag (e.g. suffix=310p-openeuler → SUFFIX=-310p-openeuler,
-          # resulting in tags like main-310p-openeuler).
-          # Leave SUFFIX empty when no suffix is provided (plain tags like main).
-          if [ -n "${{ inputs.suffix }}" ]; then
-            echo "SUFFIX=-${{ inputs.suffix }}" >> $GITHUB_ENV
-          else
-            echo "SUFFIX=" >> $GITHUB_ENV
-          fi
-
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          # TODO(yikun): add more hub image and a note on release policy for container image
-          images: |
-            ${{ env.QUAY_REPO }}
-          # Three trigger scenarios and resulting image tags:
-          # https://github.com/marketplace/actions/docker-metadata-action#typeref
-          #
-          # 1. Push tag (on: push tags: v*) → type=pep440
-          #    Only pep440-compliant tags are published:
-          #    - v0.16.0rc1       --> vllm-ascend:v0.16.0rc1[-suffix]
-          #    Non-pep440 tags are ignored.
-          #
-          # 2. Schedule (on: schedule) → type=schedule,pattern=main
-          #    Triggered by cron, always produces a fixed tag:
-          #    - (any schedule run) --> vllm-ascend:main[-suffix]
-          #
-          # 3. Manual (on: workflow_dispatch) → type=raw,value=inputs.workflow_dispatch_tag
-          #    Tag is determined by the user-selected input at dispatch time:
-          #    - inputs.tag=main       --> vllm-ascend:main[-suffix]
-          #    - inputs.tag=v0.16.0rc1 --> vllm-ascend:v0.16.0rc1[-suffix]
-          tags: |
-            type=pep440,pattern={{raw}},suffix=${{ env.SUFFIX }}
-            type=schedule,pattern=${{ inputs.schedule_tag_pattern }},prefix=nightly-,suffix=${{ env.SUFFIX }}
-            type=raw,value=${{ inputs.workflow_dispatch_tag }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.workflow_dispatch_tag != '' }},suffix=${{ env.SUFFIX }}
-            type=raw,value=${{ inputs.branch_ref }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.workflow_dispatch_tag == '' }},prefix=nightly-,suffix=${{ env.SUFFIX }}
-          flavor:
-            latest=false
-
-      - name: Login to Quay
-        uses: docker/login-action@v4
-        with:
-          registry: quay.io
-          username: ${{ inputs.quay_username }}
-          password: ${{ secrets.QUAY_PASSWORD }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Merge and push multi-arch image
-        env:
-          IMAGE: ${{ env.QUAY_TEMP_REPO }}
-          TAGS: ${{ steps.meta.outputs.tags }}
-        run: |
-          DIGESTS=$(printf "$IMAGE@sha256:%s " $(ls ${{ runner.temp }}/digests))
-
-          echo "Digests: $DIGESTS"
-          echo "Current tags:"
-          echo "$TAGS"
-
-          for tag in $TAGS; do
-            echo "Creating tag $tag"
-            docker buildx imagetools create \
-              -t "$tag" \
-              $DIGESTS
-          done
-
-  merge-image-temp:
-    name: merge-image-temp
-    runs-on: ubuntu-latest
-    needs: build-push-digest
-    if: ${{ inputs.should_push && inputs.temp_only }}
-    steps:
-      - name: Download arm64 digests
-        uses: actions/download-artifact@v8
-        with:
-          path: ${{ runner.temp }}/digests
-          pattern: ${{ inputs.artifact_prefix }}-${{ inputs.suffix }}-arm64
-          merge-multiple: true
-
-      - name: Download amd64 digests
-        uses: actions/download-artifact@v8
-        with:
-          path: ${{ runner.temp }}/digests
-          pattern: ${{ inputs.artifact_prefix }}-${{ inputs.suffix }}-amd64
-          merge-multiple: true
-
-      - name: Login to Quay Temp
-        uses: docker/login-action@v4
-        with:
-          registry: quay.io
-          username: ${{ inputs.quay_temp_username }}
-          password: ${{ secrets.QUAY_TEMP_PASSWORD }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Merge and push multi-arch manifest to QUAY_TEMP_REPO
-        env:
-          IMAGE: ${{ env.QUAY_TEMP_REPO }}
-        run: |
-          set -euo pipefail
+        if [ "${SHOULD_PUSH}" = "true" ]; then
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
           SUFFIX=""
-          if [ -n "${{ inputs.suffix }}" ]; then
-            SUFFIX="-${{ inputs.suffix }}"
+          if [ -n "${SUFFIX_INPUT}" ]; then
+            SUFFIX="-${SUFFIX_INPUT}-${TIMESTAMP}"
+          else
+            SUFFIX="-${TIMESTAMP}"
           fi
-          VLLM_SHORT=$(echo "${{ inputs.vllm_commit }}" | cut -c1-7)
-          ASCEND_SHORT=$(echo "${{ inputs.vllm_ascend_commit }}" | cut -c1-7)
-          TAG="${IMAGE}:vllm-ascend-${VLLM_SHORT}-${ASCEND_SHORT}${SUFFIX}"
-          DIGESTS=$(printf "$IMAGE@sha256:%s " $(ls ${{ runner.temp }}/digests))
-          echo "Digests: $DIGESTS"
-          echo "Creating multi-arch manifest tag: $TAG"
-          docker buildx imagetools create \
-            -t "$TAG" \
-            $DIGESTS
+          if [ "${TEMP_ONLY}" = "true" ]; then
+            VLLM_SHORT=$(echo "${VLLM_COMMIT_INPUT}" | cut -c1-7)
+            ASCEND_SHORT=$(echo "${VLLM_ASCEND_COMMIT_INPUT}" | cut -c1-7)
+            TEMP_TAG="vllm-ascend-${VLLM_SHORT}-${ASCEND_SHORT}${SUFFIX}-${MATRIX_TAG}-temp"
+          else
+            TEMP_TAG="nightly-${SCHEDULE_TAG_PATTERN}${SUFFIX}-${MATRIX_TAG}-temp"
+          fi
+          echo "Building and pushing with temp tag: ${QUAY_TEMP_REPO}:${TEMP_TAG}"
+          BUILD_ARGS+=(
+            --output "type=image,name=${QUAY_TEMP_REPO}:${TEMP_TAG},push=true"
+            --export-cache "type=registry,ref=${CACHE_REPO}:${CACHE_TAG},mode=max,ignore-error=true"
+          )
+        else
+          echo "Building without exporting or pushing an image."
+        fi
+
+        buildctl \
+          --addr="$BUILDKITD_ADDR" \
+          --tlscacert="${TLS_CONFIG_DIR}/ca.pem" \
+          --tlscert="${TLS_CONFIG_DIR}/cert.pem" \
+          --tlskey="${TLS_CONFIG_DIR}/key.pem" \
+          build \
+          "${BUILD_ARGS[@]}"
+
+        if [ "${SHOULD_PUSH}" = "true" ]; then
+          if [ ! -s /tmp/metadata.json ]; then
+            echo "Error: BuildKit did not create /tmp/metadata.json."
+            exit 1
+          fi
+          DIGEST=$(awk -F'"' '/"containerimage.digest"/ { print $4; exit }' /tmp/metadata.json)
+          if [ -z "${DIGEST}" ]; then
+            echo "Error: containerimage.digest is missing from BuildKit metadata."
+            exit 1
+          fi
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Image pushed: ${QUAY_TEMP_REPO}:${TEMP_TAG} (${DIGEST})"
+        fi
