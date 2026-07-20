@@ -117,14 +117,14 @@ jobs:
               ba2 = os.environ.get("BUILD_A2") == "true"
               ba3 = os.environ.get("BUILD_A3") == "true"
               b310p = os.environ.get("BUILD_310P") == "true"
-              bu = os.environ.get("BUILD_UBUNTU") == "true"
+              build_ubuntu = os.environ.get("BUILD_UBUNTU") == "true"
               bo = os.environ.get("BUILD_OPENEULER") == "true"
               entries = []
-              if ba2 and bu: entries.append(all_entries[0])
+              if ba2 and build_ubuntu: entries.append(all_entries[0])
               if ba2 and bo: entries.append(all_entries[1])
-              if ba3 and bu: entries.append(all_entries[2])
+              if ba3 and build_ubuntu: entries.append(all_entries[2])
               if ba3 and bo: entries.append(all_entries[3])
-              if b310p and bu: entries.append(all_entries[4])
+              if b310p and build_ubuntu: entries.append(all_entries[4])
               if b310p and bo: entries.append(all_entries[5])
           print(f"matrix={json.dumps({'build_meta': entries})}")
           PYEOF
