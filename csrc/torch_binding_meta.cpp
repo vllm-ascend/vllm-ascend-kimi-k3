@@ -1753,54 +1753,79 @@ chunk_kda_fwd_meta(
     c10::optional<bool> safe_gate,
     c10::optional<bool> transpose_state_layout)
 {
-    std::string layout_str(layout.data(), layout.size());
+    std::string layout_str = std::string(layout);
     bool is_tnd = layout_str == "TND";
     bool is_ntd = layout_str == "NTD";
     bool is_bnsd = layout_str == "BNSD";
     bool is_rank3 = is_tnd || is_ntd;
     bool is_internal_layout = is_bnsd || is_ntd;
 
-    auto q_sizes = q.sizes();
-    auto v_sizes = v.sizes();
-    int64_t B = is_rank3 ? 1 : q_sizes[0];
-    int64_t T = is_tnd ? q_sizes[0] : (is_ntd ? q_sizes[1] : (is_bnsd ? q_sizes[2] : q_sizes[1]));
-    int64_t K = is_rank3 ? q_sizes[2] : q_sizes[3];
-    int64_t HV = is_tnd ? v_sizes[1] : (is_ntd ? v_sizes[0] : (is_bnsd ? v_sizes[1] : v_sizes[2]));
-    int64_t V = is_rank3 ? v_sizes[2] : v_sizes[3];
-    int64_t seq_num = cu_seqlens.has_value() ? static_cast<int64_t>(cu_seqlens->size()) - 1 : B;
-    int64_t total_chunks = 0;
+    c10::SymInt B = is_rank3 ? c10::SymInt(1) : q.sym_size(0);
+    c10::SymInt T = is_tnd ? q.sym_size(0) :
+        (is_ntd ? q.sym_size(1) : (is_bnsd ? q.sym_size(2) : q.sym_size(1)));
+    c10::SymInt K = is_rank3 ? q.sym_size(2) : q.sym_size(3);
+    c10::SymInt HV = is_tnd ? v.sym_size(1) :
+        (is_ntd ? v.sym_size(0) : (is_bnsd ? v.sym_size(1) : v.sym_size(2)));
+    c10::SymInt V = is_rank3 ? v.sym_size(2) : v.sym_size(3);
+    // symbolic-meta-ok: cu_seqlens is an IntArrayRef schema argument, not a Tensor shape.
+    c10::SymInt seq_num = cu_seqlens.has_value() ?
+        c10::SymInt(static_cast<int64_t>(cu_seqlens->size()) - 1) : B;
+    c10::SymInt total_chunks(0);
     if (chunk_indices.has_value()) {
-        total_chunks = static_cast<int64_t>(chunk_indices->size()) / 2;
+        // symbolic-meta-ok: chunk_indices is an IntArrayRef schema argument, not a Tensor shape.
+        total_chunks = c10::SymInt(static_cast<int64_t>(chunk_indices->size()) / 2);
     } else if (cu_seqlens.has_value()) {
+        int64_t concrete_total_chunks = 0;
+        // symbolic-meta-ok: cu_seqlens is an IntArrayRef schema argument, not a Tensor shape.
         for (size_t i = 0; i + 1 < cu_seqlens->size(); ++i) {
-            total_chunks += ((*cu_seqlens)[i + 1] - (*cu_seqlens)[i] + chunk_size - 1) / chunk_size;
+            concrete_total_chunks += ((*cu_seqlens)[i + 1] - (*cu_seqlens)[i] + chunk_size - 1) / chunk_size;
         }
+        total_chunks = c10::SymInt(concrete_total_chunks);
     } else {
-        total_chunks = (T + chunk_size - 1) / chunk_size;
+        total_chunks = (T + c10::SymInt(chunk_size - 1)) / c10::SymInt(chunk_size);
     }
 
     at::Tensor o = at::empty_like(v);
-    at::Tensor final_state_work = at::empty({seq_num, HV, K, V}, q.options().dtype(at::kFloat));
+    at::Tensor final_state_work = at::empty_symint(
+        c10::SymDimVector{seq_num, HV, K, V}, q.options().dtype(at::kFloat));
     at::Tensor final_state = output_final_state.value_or(false) ?
-        final_state_work : at::empty({0}, q.options().dtype(at::kFloat));
-    at::Tensor g = gk.scalar_type() == at::kFloat ? gk : at::empty(gk.sizes(), gk.options().dtype(at::kFloat));
-    at::Tensor aqk = is_rank3 ? (is_internal_layout ? at::empty({HV, T, chunk_size}, q.options()) :
-        at::empty({T, HV, chunk_size}, q.options())) : (is_internal_layout ?
-        at::empty({B, HV, T, chunk_size}, q.options()) : at::empty({B, T, HV, chunk_size}, q.options()));
+        final_state_work : at::empty_symint(c10::SymDimVector{c10::SymInt(0)}, q.options().dtype(at::kFloat));
+    at::Tensor g = gk.scalar_type() == at::kFloat ?
+        gk : at::empty_symint(gk.sym_sizes(), gk.options().dtype(at::kFloat));
+    c10::SymInt chunk_size_sym(chunk_size);
+    c10::SymDimVector aqk_shape;
+    if (is_rank3) {
+        aqk_shape = is_internal_layout ? c10::SymDimVector{HV, T, chunk_size_sym} :
+            c10::SymDimVector{T, HV, chunk_size_sym};
+    } else {
+        aqk_shape = is_internal_layout ? c10::SymDimVector{B, HV, T, chunk_size_sym} :
+            c10::SymDimVector{B, T, HV, chunk_size_sym};
+    }
+    at::Tensor aqk = at::empty_symint(aqk_shape, q.options());
     at::Tensor akk = at::empty_like(aqk);
-    at::Tensor w = is_rank3 ? (is_internal_layout ? at::empty({HV, T, K}, q.options()) :
-        at::empty({T, HV, K}, q.options())) : (is_internal_layout ?
-        at::empty({B, HV, T, K}, q.options()) : at::empty({B, T, HV, K}, q.options()));
+    c10::SymDimVector w_shape;
+    if (is_rank3) {
+        w_shape = is_internal_layout ? c10::SymDimVector{HV, T, K} : c10::SymDimVector{T, HV, K};
+    } else {
+        w_shape = is_internal_layout ? c10::SymDimVector{B, HV, T, K} : c10::SymDimVector{B, T, HV, K};
+    }
+    at::Tensor w = at::empty_symint(w_shape, q.options());
     at::Tensor u = at::empty_like(v);
     at::Tensor qg = at::empty_like(w);
     at::Tensor kg = at::empty_like(w);
     at::Tensor v_new = at::empty_like(v);
-    at::Tensor h = is_rank3 ? (is_internal_layout ? at::empty({HV, total_chunks, K, V}, q.options()) :
-        at::empty({total_chunks, HV, K, V}, q.options())) : (is_internal_layout ?
-        at::empty({B, HV, total_chunks, K, V}, q.options()) :
-        at::empty({B, total_chunks, HV, K, V}, q.options()));
+    c10::SymDimVector h_shape;
+    if (is_rank3) {
+        h_shape = is_internal_layout ? c10::SymDimVector{HV, total_chunks, K, V} :
+            c10::SymDimVector{total_chunks, HV, K, V};
+    } else {
+        h_shape = is_internal_layout ? c10::SymDimVector{B, HV, total_chunks, K, V} :
+            c10::SymDimVector{B, total_chunks, HV, K, V};
+    }
+    at::Tensor h = at::empty_symint(h_shape, q.options());
     at::Tensor initial_state_tensor = initial_state.value_or(at::Tensor());
-    at::Tensor initial_state_out = initial_state_tensor.defined() ? initial_state_tensor : at::empty({0}, q.options());
+    at::Tensor initial_state_out = initial_state_tensor.defined() ?
+        initial_state_tensor : at::empty_symint(c10::SymDimVector{c10::SymInt(0)}, q.options());
     (void)k;
     (void)beta;
     (void)scale;
@@ -1829,21 +1854,21 @@ at::Tensor kda_gate_cumsum_meta(
     (void)safe_gate;
     (void)lower_bound;
     (void)layout;
-    return at::empty(g.sizes(), g.options().dtype(at::kFloat));
+    return at::empty_symint(g.sym_sizes(), g.options().dtype(at::kFloat));
 }
 
 at::Tensor kda_layout_swap12_meta(
     const at::Tensor &x,
     const c10::optional<at::Tensor> &dependency)
 {
-    std::vector<int64_t> y_sizes(x.sizes().begin(), x.sizes().end());
+    c10::SymDimVector y_sizes(x.sym_sizes().begin(), x.sym_sizes().end());
     if (x.dim() == 3) {
         std::swap(y_sizes[0], y_sizes[1]);
     } else {
         std::swap(y_sizes[1], y_sizes[2]);
     }
     (void)dependency;
-    return at::empty(y_sizes, x.options());
+    return at::empty_symint(y_sizes, x.options());
 }
 
 void store_kv_block_metadata(
