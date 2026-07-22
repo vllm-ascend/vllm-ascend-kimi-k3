@@ -126,6 +126,7 @@ class ReqMeta:
     num_prompt_blocks: int
     remote_block_size: int
     local_full_block_ids: BlockIds = tuple()
+    remote_cache_group_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1504,6 +1505,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             num_prompt_blocks=kv_transfer_params.get("num_prompt_blocks", 0),
             remote_block_size=kv_transfer_params.get("remote_block_size", 0),
             local_full_block_ids=local_full_block_ids or tuple(),
+            remote_cache_group_count=kv_transfer_params.get("remote_cache_group_count"),
         )
 
 
@@ -1903,6 +1905,13 @@ class MooncakeConnectorScheduler:
         ):
             return False, None
 
+        if len(block_ids) != len(self.group_transfer_info):
+            raise ValueError(
+                "Mooncake request block-id metadata does not match the KV cache groups: "
+                f"block_group_count={len(block_ids)}, "
+                f"cache_group_count={len(self.group_transfer_info)}."
+            )
+
         num_prompt_blocks = math.ceil(len(request.prompt_token_ids) / self.block_size)
         computed_block_ids = self._get_transfer_block_ids(block_ids, len(request.prompt_token_ids))
         computed_block_ids = self._get_swa_transfer_block_ids(computed_block_ids)
@@ -1927,6 +1936,7 @@ class MooncakeConnectorScheduler:
             remote_multi_nodes_meta_mapping=self.multi_nodes_meta_mapping,
             num_prompt_blocks=num_prompt_blocks,
             remote_block_size=self.block_size,
+            remote_cache_group_count=len(self.group_transfer_info),
         )
 
     def _port_offset_from_handshake_metadata(
@@ -2620,6 +2630,32 @@ class MooncakeConnectorWorker:
     def _get_kv_cache_group_id(group_idx: int, group_spec: dict[str, Any]) -> int:
         return group_spec.get("kv_cache_group_id", group_idx)
 
+    def _validate_kv_block_id_groups(self, meta: ReqMeta) -> None:
+        required_group_ids = {
+            self._get_kv_cache_group_id(group_idx, group_spec)
+            for group_idx, (group_spec, layer_indices) in self.kv_group2layeridx.items()
+            if layer_indices
+        }
+        missing_local = sorted(
+            group_id
+            for group_id in required_group_ids
+            if group_id >= len(meta.local_block_ids)
+        )
+        missing_remote = sorted(
+            group_id
+            for group_id in required_group_ids
+            if group_id >= len(meta.remote_block_ids)
+        )
+        if missing_local or missing_remote:
+            raise ValueError(
+                "Mooncake KV block-id metadata does not cover all cache groups: "
+                f"required_group_ids={sorted(required_group_ids)}, "
+                f"local_group_count={len(meta.local_block_ids)}, "
+                f"remote_group_count={len(meta.remote_block_ids)}, "
+                f"remote_config_group_count={getattr(meta, 'remote_cache_group_count', None)}, "
+                f"missing_local={missing_local}, missing_remote={missing_remote}."
+            )
+
     def _get_kernel_block_ids(self, layer_indices, meta, group_idx, group_spec):
         """No-CP per-group block ids at kernel granularity: (local, remote).
 
@@ -2727,6 +2763,7 @@ class MooncakeConnectorWorker:
         P workers. This method also accounts for unequal P/D prefix-cache hits
         by reducing the number of remote blocks that still need to be pulled.
         """
+        self._validate_kv_block_id_groups(meta)
         prefill_tp_size: int = meta.remote_ptp_size if meta.remote_ptp_size is not None else self._prefill_tp_size
 
         if meta.remote_pcp_size * meta.remote_dcp_size * self.pcp_size * self.dcp_size == 1:

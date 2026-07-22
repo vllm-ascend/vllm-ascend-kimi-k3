@@ -2118,6 +2118,72 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
         self.assertEqual(params["num_prompt_blocks"], 4)
         self.assertIn("req_mixed_groups", self.scheduler._reqs_need_send)
 
+    def test_request_finished_preserves_kimi_k3_cache_groups(self):
+        self.scheduler.group_transfer_info = [
+            types.SimpleNamespace(
+                tokens_per_block=384,
+                blocks_per_window=0,
+                is_state_group=False,
+            ),
+            *[
+                types.SimpleNamespace(
+                    tokens_per_block=384,
+                    blocks_per_window=0,
+                    is_state_group=True,
+                )
+                for _ in range(3)
+            ],
+        ]
+        request = self._make_remote_decode_request(prompt_len=512, request_id="req_kimi_k3_groups")
+
+        delay_free, params = self.scheduler.request_finished(
+            request,
+            (
+                [100, 101],
+                [200],
+                [201],
+                [202],
+            ),
+        )
+
+        self.assertTrue(delay_free)
+        self.assertIsNotNone(params)
+        assert params is not None
+        self.assertEqual(params["remote_cache_group_count"], 4)
+        self.assertEqual(
+            params["remote_block_ids"],
+            (
+                [100, 101],
+                [200],
+                [201],
+                [202],
+            ),
+        )
+
+    def test_request_finished_rejects_incomplete_kimi_k3_cache_groups(self):
+        self.scheduler.group_transfer_info = [
+            types.SimpleNamespace(
+                tokens_per_block=384,
+                blocks_per_window=0,
+                is_state_group=group_idx > 0,
+            )
+            for group_idx in range(4)
+        ]
+        request = self._make_remote_decode_request(prompt_len=512, request_id="req_kimi_k3_missing_group")
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"block_group_count=3, cache_group_count=4",
+        ):
+            self.scheduler.request_finished(
+                request,
+                (
+                    [100, 101],
+                    [200],
+                    [201],
+                ),
+            )
+
 
 class TestUtils(unittest.TestCase):
     def test_string_to_int64_hash(self):
@@ -3242,6 +3308,101 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         self.assertEqual(len(ports), 1)
         self.assertEqual(local_ids, [([70, 71, 72, 73], [80, 81, 82, 83])])
         self.assertEqual(remote_ids, [([50, 51, 52, 53], [60, 61, 62, 63])])
+
+    def test_kimi_k3_no_cp_preserves_all_scheduler_cache_groups(self):
+        with patch.object(
+            self.vllm_config.kv_transfer_config,
+            "get_from_extra_config",
+            side_effect=lambda k, d=None: {
+                "prefill": {"tp_size": 16, "dp_size": 4, "pp_size": 1},
+                "decode": {"tp_size": 16, "dp_size": 4, "pp_size": 1},
+            }.get(k, d),
+        ):
+            self.vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
+            self.vllm_config.model_config.is_deepseek_mla = False
+            self.vllm_config.model_config.hf_text_config.num_key_value_heads = 96
+            worker = MooncakeConnectorWorker(
+                self.vllm_config, self.engine_id, MockKVCacheConfig()
+            )
+
+        worker._is_hma_required = True
+        worker.use_mla = False
+        worker.use_sparse = False
+        worker.num_key_value_heads = 96
+        worker.tp_size = 16
+        worker.tp_rank = 12
+        worker.pcp_size = 1
+        worker.dcp_size = 1
+        worker.pcp_rank = 0
+        worker.dcp_rank = 0
+        worker._decode_tp_size = 16
+        worker._prefill_tp_size = 16
+        worker._prefill_pp_size = 1
+        worker.block_size_scale = [[1], [1], [1], [1]]
+        worker.kv_group2layeridx = {
+            0: (
+                {
+                    "kv_cache_spec_type": "AscendMLAAttentionSpec",
+                    "kv_cache_group_id": 0,
+                    "kv_cache_spec": {"num_kv_heads": 1},
+                },
+                [3],
+            ),
+            1: ({"kv_cache_spec_type": "MambaSpec", "kv_cache_group_id": 1}, [0]),
+            2: ({"kv_cache_spec_type": "MambaSpec", "kv_cache_group_id": 2}, [1]),
+            3: ({"kv_cache_spec_type": "MambaSpec", "kv_cache_group_id": 3}, [2]),
+        }
+
+        meta = types.SimpleNamespace(
+            remote_pcp_size=1,
+            remote_dcp_size=1,
+            remote_ptp_size=16,
+            remote_port=31000,
+            remote_block_ids=([50, 51], [60], [61], [62]),
+            local_block_ids=([70, 71], [80], [81], [82]),
+            num_external_tokens=2 * worker.block_size,
+            num_prompt_blocks=2,
+            num_computed_tokens=0,
+            remote_engine_id="remote_kimi_k3_tp16",
+            remote_host="localhost",
+            remote_multi_nodes_meta_mapping={},
+            remote_block_size=worker.block_size,
+        )
+
+        ports, local_ids, remote_ids = worker._get_kv_split_metadata("req_kimi_k3", cast(ReqMeta, meta))
+
+        self.assertEqual(ports, [[31012]])
+        self.assertEqual(local_ids, [([70, 71], [80], [81], [82])])
+        self.assertEqual(remote_ids, [([50, 51], [60], [61], [62])])
+
+    def test_kimi_k3_no_cp_reports_missing_remote_cache_group(self):
+        worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+        worker.kv_group2layeridx = {
+            0: (
+                {
+                    "kv_cache_spec_type": "AscendMLAAttentionSpec",
+                    "kv_cache_group_id": 0,
+                },
+                [3],
+            ),
+            1: ({"kv_cache_spec_type": "MambaSpec", "kv_cache_group_id": 1}, [0]),
+            2: ({"kv_cache_spec_type": "MambaSpec", "kv_cache_group_id": 2}, [1]),
+            3: ({"kv_cache_spec_type": "MambaSpec", "kv_cache_group_id": 3}, [2]),
+        }
+        meta = types.SimpleNamespace(
+            local_block_ids=([70, 71], [80], [81], [82]),
+            remote_block_ids=([50, 51], [60], [61]),
+            remote_cache_group_count=3,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"required_group_ids=\[0, 1, 2, 3\].*remote_group_count=3.*"
+            r"remote_config_group_count=3.*missing_remote=\[3\]",
+        ):
+            worker._get_kv_split_metadata(
+                "req_kimi_k3_missing_group", cast(ReqMeta, meta)
+            )
 
     def test_get_tp_num_need_pulls(self):
         worker = MooncakeConnectorWorker(self.vllm_config, self.engine_id, MockKVCacheConfig())
