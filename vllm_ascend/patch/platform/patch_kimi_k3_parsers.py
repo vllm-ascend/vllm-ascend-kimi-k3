@@ -61,6 +61,7 @@ from vllm_ascend.patch.platform.kimi_k3_xtml import (
     KimiK3ParseSnapshot,
     KimiK3XTMLParseError,
     KimiK3XTMLStateMachine,
+    ToolMode,
     partial_marker_overlap,
 )
 
@@ -157,6 +158,7 @@ def _state_machine_for_request(
     allowed_tool_names = frozenset(name for tool in tools if (name := _tool_name(tool)))
     choice = request.tool_choice
     named_tool = _named_tool_choice(request)
+    tool_mode: ToolMode
 
     if named_tool:
         tool_mode = "named"
