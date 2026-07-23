@@ -253,7 +253,9 @@ def test_async_renderer_preserves_multimodal_data(monkeypatch):
         "multi_modal_uuids": mm_uuids,
     }
     apply_template.assert_awaited_once_with(conversation, return_dict=False)
-    assert parse_messages.await_args.kwargs["content_format"] == "openai"
+    await_args = parse_messages.await_args
+    assert await_args is not None
+    assert await_args.kwargs["content_format"] == "openai"
 
 
 def test_openai_chat_kwargs_are_scoped_by_served_model_type():

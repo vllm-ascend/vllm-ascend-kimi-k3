@@ -38,6 +38,7 @@ def real_kimi_k3_tokenizer():
     tokenizer_path = os.getenv(_TOKENIZER_PATH_ENV)
     if not tokenizer_path:
         pytest.skip(f"{_TOKENIZER_PATH_ENV} is not set")
+    assert tokenizer_path is not None
     path = Path(tokenizer_path)
     for filename, expected_digest in _KIMI_K3_TOKENIZER_FILE_SHA256.items():
         tokenizer_file = path / filename
