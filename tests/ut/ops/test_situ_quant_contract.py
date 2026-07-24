@@ -212,8 +212,8 @@ def test_migrated_sources_only_use_resolvable_includes():
     assert '"../../op_kernel/arch35/situ_mx_quant_tiling_key.h"' in tiling
     assert '"../inc/platform.h"' in common
     assert '"../inc/kernel_utils.h"' in common
-    assert '"op_kernel/math_util.h"' in common
-    assert '"op_kernel/platform_util.h"' in common
+    assert '"op_kernel/math_util.h"' not in kernel
+    assert '"op_kernel/platform_util.h"' not in kernel
     assert "Ops::Base::IsUnknownRank" not in infer_shape
     assert "Ops::Base::SetUnknownRank" not in infer_shape
     assert (MX_ROOT / "op_kernel/inc/platform.h").is_file()

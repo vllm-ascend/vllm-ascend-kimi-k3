@@ -20,8 +20,6 @@
 
 #include "kernel_operator.h"
 #include "kernel_tiling/kernel_tiling.h"
-#include "op_kernel/math_util.h"
-#include "op_kernel/platform_util.h"
 #include "../inc/platform.h"
 #include "../inc/kernel_utils.h"
 
@@ -56,9 +54,9 @@ constexpr int64_t CONST_64 = 64;
 constexpr int64_t CONST_32 = 32;
 constexpr int64_t CONST_2 = 2;
 constexpr int64_t CONST_4 = 4;
-constexpr uint32_t VF_LEN_T = Ops::Base::GetVRegSize() / sizeof(half);     // 128
-constexpr uint32_t VF_LEN_FP32 = Ops::Base::GetVRegSize() / sizeof(float); // 64
-constexpr uint32_t ONE_BLOCK_UB = Ops::Base::GetUbBlockSize();
+constexpr uint32_t VF_LEN_T = platform::GetVRegSize() / sizeof(half);     // 128
+constexpr uint32_t VF_LEN_FP32 = platform::GetVRegSize() / sizeof(float); // 64
+constexpr uint32_t ONE_BLOCK_UB = platform::GetUbBlockSize();
 constexpr uint32_t ONE_BLOCK_NUM = ONE_BLOCK_UB / sizeof(half); // 16
 
 // ==================== Cast Traits ====================
