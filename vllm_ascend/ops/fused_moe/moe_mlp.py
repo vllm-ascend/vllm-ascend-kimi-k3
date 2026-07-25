@@ -138,10 +138,12 @@ def _w4a16_mxfp4_situ_apply_mlp(
         group_type=0,
         output_dtype=hidden_states.dtype,
     )[0]
-    hidden_states = situ_and_mul(
+    hidden_states = torch.ops._C_ascend.situ_glu(
         gate_up_out,
+        dim=-1,
         beta=activation.beta,
         linear_beta=activation.linear_beta,
+        activate_left=True,
     )
     before_gmm2_evt = torch.npu.current_stream().record_event()
     hidden_states = DeviceOperator.npu_grouped_matmul_gmm2(

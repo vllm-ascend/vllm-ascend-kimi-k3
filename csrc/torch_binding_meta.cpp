@@ -2013,6 +2013,37 @@ std::tuple<at::Tensor, at::Tensor> situ_mx_quant_meta(
     return {y, mxscale};
 }
 
+at::Tensor situ_glu_meta(
+    const at::Tensor& x,
+    int64_t dim,
+    double beta,
+    double linear_beta,
+    bool activate_left)
+{
+    (void)beta;
+    (void)linear_beta;
+    (void)activate_left;
+
+    TORCH_CHECK(x.dim() >= 1 && x.dim() <= 8,
+                "situ_glu: x rank must be in [1, 8], but got ", x.dim());
+    TORCH_CHECK(x.scalar_type() == at::kFloat ||
+                    x.scalar_type() == at::kHalf ||
+                    x.scalar_type() == at::kBFloat16,
+                "situ_glu: x must be float32, float16, or bfloat16, but got ",
+                x.scalar_type());
+
+    const int64_t normalized_dim = dim < 0 ? dim + x.dim() : dim;
+    TORCH_CHECK(normalized_dim >= 0 && normalized_dim < x.dim(),
+                "situ_glu: dim must be in [", -x.dim(), ", ", x.dim() - 1,
+                "], but got ", dim);
+
+    c10::SymDimVector y_shape(x.sym_sizes().begin(), x.sym_sizes().end());
+    TORCH_CHECK(y_shape[normalized_dim] % 2 == 0,
+                "situ_glu: x size at dim ", dim, " must be even");
+    y_shape[normalized_dim] = y_shape[normalized_dim] / 2;
+    return at::empty_symint(y_shape, x.options());
+}
+
 } // namespace meta
 } // namespace vllm_ascend
 
@@ -2048,6 +2079,7 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_recurrent_gated_delta_rule", &vllm_ascend::meta::npu_recurrent_gated_delta_rule_meta);
     ops.impl("recurrent_kda", &vllm_ascend::meta::recurrent_kda_meta);
     ops.impl("dequant_situ_quant", &vllm_ascend::meta::dequant_situ_quant_meta);
+    ops.impl("situ_glu", &vllm_ascend::meta::situ_glu_meta);
     ops.impl("situ_mx_quant", &vllm_ascend::meta::situ_mx_quant_meta);
     // Launch host print from device
     ops.impl("device_print", &vllm_ascend::meta::device_print_meta);

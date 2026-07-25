@@ -56,6 +56,7 @@
 #include "attention/fused_gdn_gating/fused_gdn_gating_torch_adpt.h"
 #ifndef ASCEND_PLATFORM_310P
 #include "moe/dequant_situ_quant/dequant_situ_quant_torch_adpt.h"
+#include "moe/situ_glu/situ_glu_torch_adpt.h"
 #include "moe/situ_mx_quant/situ_mx_quant_torch_adpt.h"
 #endif
 #include <c10/core/Device.h>
@@ -2637,6 +2638,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                   bool activate_left=True, "
         "                   str quant_mode=\"dynamic\") -> (Tensor y, Tensor scale)");
     ops.impl("dequant_situ_quant", torch::kPrivateUse1, &vllm_ascend::dequant_situ_quant);
+
+    ops.def(
+        "situ_glu(Tensor x, "
+        "         int dim=-1, "
+        "         float beta=1.0, "
+        "         float linear_beta=0.0, "
+        "         bool activate_left=True) -> Tensor");
+    ops.impl("situ_glu", torch::kPrivateUse1, &vllm_ascend::situ_glu);
 
     ops.def(
         "situ_mx_quant(Tensor x, "
