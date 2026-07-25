@@ -79,12 +79,12 @@ std::tuple<at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &>
         enable_inner_out.has_value()
             ? enable_inner_out.value()
             : false;
-    
     auto [workspace_tensor, tiling, block_dim] = mlapo::mla_preprocess_tiling(
         hiddenState,
         wdqkv,
         wuk,
         gamma1,
+        kv_cache,
         kv_cache_rope,
         cache_mode,
         quant_mode,
