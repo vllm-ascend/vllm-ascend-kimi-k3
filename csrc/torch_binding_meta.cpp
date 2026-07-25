@@ -1875,6 +1875,42 @@ chunk_kda_fwd_meta(
     return std::make_tuple(o, final_state, g, aqk, akk, w, u, qg, kg, v_new, h, initial_state_out);
 }
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+chunk_kda_bwd_intra_meta(
+    const at::Tensor &q,
+    const at::Tensor &k,
+    const at::Tensor &gk,
+    const at::Tensor &beta,
+    const at::Tensor &dAqk,
+    const at::Tensor &dAkk,
+    const at::Tensor &dq,
+    const at::Tensor &dk,
+    const at::Tensor &db,
+    const at::Tensor &dg,
+    c10::optional<at::IntArrayRef> cu_seqlens,
+    c10::optional<at::IntArrayRef> chunk_indices,
+    int64_t chunk_size,
+    bool safe_gate,
+    c10::string_view layout)
+{
+    (void)q;
+    (void)k;
+    (void)gk;
+    (void)beta;
+    (void)dAqk;
+    (void)dAkk;
+    (void)cu_seqlens;
+    (void)chunk_indices;
+    (void)chunk_size;
+    (void)safe_gate;
+    (void)layout;
+    return std::make_tuple(
+        at::empty_like(dq),
+        at::empty_like(dk),
+        at::empty_like(db),
+        at::empty_like(dg));
+}
+
 at::Tensor kda_gate_cumsum_meta(
     const at::Tensor &g,
     int64_t chunk_size,
@@ -2139,6 +2175,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("chunk_fwd_o", &vllm_ascend::meta::chunk_fwd_o_meta);
     // chunk_kda_fwd
     ops.impl("chunk_kda_fwd", &vllm_ascend::meta::chunk_kda_fwd_meta);
+    // chunk_kda_bwd_intra
+    ops.impl("chunk_kda_bwd_intra", &vllm_ascend::meta::chunk_kda_bwd_intra_meta);
     // kda_gate_cumsum
     ops.impl("kda_gate_cumsum", &vllm_ascend::meta::kda_gate_cumsum_meta);
     // kda_layout_swap12
