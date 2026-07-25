@@ -1849,7 +1849,7 @@ class TestAscendMLAImpl(TestBase):
     @patch("vllm_ascend.attention.mla_v1.DeviceOperator")
     @patch("torch_npu.npu_fused_infer_attention_score")
     def test_forward_prefill_non_power_of_two_heads(self, mock_fia, mock_device_operator, mock_get_current_vllm_config):
-        """Test prefill with non-power-of-2 heads uses concat instead of query_rope/key_rope kwargs."""
+        """Test prefill passes RoPE tensors separately for non-power-of-2 heads."""
         mock_get_current_vllm_config.return_value = MagicMock()
         num_heads = 20
         kwargs = {
@@ -1905,12 +1905,15 @@ class TestAscendMLAImpl(TestBase):
 
         result = impl._forward_prefill(q_nope, q_pe, k_nope, k_pe, value, kv_c_and_k_pe_cache, attn_metadata)
 
-        # FIA should be called without query_rope/key_rope when head_padding > 0
+        # FIA always receives the no-RoPE and RoPE dimensions separately.
         mock_fia.assert_called_once()
         call_kwargs = mock_fia.call_args.kwargs
-        self.assertNotIn("query_rope", call_kwargs)
-        self.assertNotIn("key_rope", call_kwargs)
+        self.assertEqual(call_kwargs["query_rope"].shape, q_pe.shape)
+        self.assertEqual(call_kwargs["key_rope"].shape, k_pe.shape)
         self.assertEqual(call_kwargs.get("num_heads"), num_heads)
+        query, key, _ = mock_fia.call_args.args
+        self.assertEqual(query.shape, q_nope.shape)
+        self.assertEqual(key.shape, k_nope.shape)
         self.assertEqual(result.shape, (batch_size, num_heads * impl.v_head_dim))
 
     @patch("torch_npu.npu_format_cast")
@@ -2210,7 +2213,7 @@ class TestAscendMLAImpl(TestBase):
     def test_compute_prefill_context_non_power_of_two_heads(
         self, mock_fia, mock_update, mock_load, mock_get_current_vllm_config
     ):
-        """Test prefill context with non-power-of-2 heads uses concat for query and key."""
+        """Test prefill context passes RoPE tensors separately for non-power-of-2 heads."""
         mock_get_current_vllm_config.return_value = MagicMock()
         num_heads = 20
         kwargs = {
@@ -2279,8 +2282,11 @@ class TestAscendMLAImpl(TestBase):
 
         mock_fia.assert_called_once()
         call_kwargs = mock_fia.call_args.kwargs
-        self.assertNotIn("query_rope", call_kwargs)
-        self.assertNotIn("key_rope", call_kwargs)
+        self.assertEqual(call_kwargs["query_rope"].shape, q_pe.shape)
+        self.assertEqual(call_kwargs["key_rope"].shape, (8, num_heads, impl.qk_rope_head_dim))
+        query, key, _ = mock_fia.call_args.args
+        self.assertEqual(query.shape, q_nope.shape)
+        self.assertEqual(key.shape, k_nope.shape)
         self.assertEqual(out.shape, prefix_out.shape)
 
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")

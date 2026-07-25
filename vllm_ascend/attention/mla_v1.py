@@ -1187,12 +1187,10 @@ class AscendMLAImpl(MLAAttentionImpl):
         out_list = [prefix_output.reshape(num_tokens * H, D)]
         lse_list = [prefix_lse.reshape(num_tokens * H)]
 
-        if self.head_padding > 0:
-            query = torch.cat((q_nope, q_pe), dim=-1)
-
         common_kwargs = {
             "num_heads": self.num_heads,
             "num_key_value_heads": self.num_heads,
+            "query_rope": q_pe,
             "input_layout": "TND",
             "atten_mask": None,
             "sparse_mode": 0,
@@ -1237,13 +1235,9 @@ class AscendMLAImpl(MLAAttentionImpl):
             actual_seq_lengths_kv = prefill_metadata.chunked_context.chunk_actual_seq_lengths_kv_list[i]
             common_kwargs["actual_seq_lengths_kv"] = actual_seq_lengths_kv
 
-            if self.head_padding > 0:
-                key = torch.cat((k_nope, k_pe), dim=-1)
-            else:
-                common_kwargs["query_rope"] = q_pe
-                common_kwargs["key_rope"] = k_pe.contiguous()
-                query = q_nope
-                key = k_nope
+            common_kwargs["key_rope"] = k_pe.contiguous()
+            query = q_nope
+            key = k_nope
 
             chunk_out, chunk_lse = torch_npu.npu_fused_infer_attention_score(
                 query, key.contiguous(), v.contiguous(), **common_kwargs
@@ -1307,13 +1301,9 @@ class AscendMLAImpl(MLAAttentionImpl):
         }
         record_attention_compute_start()
 
-        if self.head_padding > 0:
-            query = torch.cat((q_nope, q_pe), dim=-1)
-            key = torch.cat((k_nope, k_pe), dim=-1)
-        else:
-            common_kwargs["query_rope"] = q_pe
-            common_kwargs["key_rope"] = k_pe.contiguous()
-            query, key = q_nope, k_nope
+        common_kwargs["query_rope"] = q_pe
+        common_kwargs["key_rope"] = k_pe.contiguous()
+        query, key = q_nope, k_nope
 
         attn_output, attn_lse = torch_npu.npu_fused_infer_attention_score(
             query, key.contiguous(), value.contiguous(), **common_kwargs
