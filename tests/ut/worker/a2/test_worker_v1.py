@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import torch
 from vllm.config import CacheConfig, ModelConfig, ParallelConfig, ProfilerConfig, VllmConfig
@@ -331,6 +331,38 @@ class TestNPUWorker(TestBase):
             worker.profile(is_start=False)
             mock_profiler.stop.assert_called_once()
 
+    @patch("pathlib.Path.mkdir")
+    @patch("vllm.distributed.utils.get_worker_rank_suffix", return_value="dp0_pp0_tp0_dcp0_ep0_rank3")
+    @patch("vllm_ascend.worker.worker.torch.npu.mem_get_info", return_value=(4 * 2**30, 64 * 2**30))
+    @patch("vllm_ascend.worker.worker.torch_npu.npu.memory._dump_snapshot")
+    @patch("vllm_ascend.worker.worker.torch_npu.npu.memory._record_memory_history")
+    def test_profile_run_with_memory_snapshot(
+        self,
+        mock_record_memory_history,
+        mock_dump_snapshot,
+        mock_mem_get_info,
+        mock_get_worker_rank_suffix,
+        mock_mkdir,
+    ):
+        """Test profile run records and dumps a rank-specific NPU memory snapshot."""
+        from vllm_ascend.worker.worker import NPUWorker
+
+        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+            worker = NPUWorker()
+            worker.rank = 3
+            worker.model_runner = MagicMock()
+
+            worker._profile_run_with_memory_snapshot()
+
+        mock_mkdir.assert_called_once_with(parents=True, exist_ok=True)
+        mock_get_worker_rank_suffix.assert_called_once_with(global_rank=3)
+        mock_mem_get_info.assert_called_once_with()
+        worker.model_runner.profile_run.assert_called_once_with()
+        mock_record_memory_history.assert_has_calls([call(context="all", stacks="all"), call(None)])
+        mock_dump_snapshot.assert_called_once_with(
+            "/mnt/weight/images/lala_tmp/problem_vLLM_profile_run_snapshot_dp0_pp0_tp0_dcp0_ep0_rank3.pickle"
+        )
+
     def test_profile_no_profiler_raises_error(self):
         """Test profile method raises exception when profiler is not available"""
         from vllm_ascend.worker.worker import NPUWorker
@@ -543,6 +575,7 @@ class TestNPUWorker(TestBase):
     @patch("torch_npu.npu.memory_stats")
     @patch("torch_npu.npu.mem_get_info")
     @patch("vllm_ascend.worker.worker.logger")
+    @patch("vllm_ascend.worker.worker.NPUWorker._profile_run_with_memory_snapshot")
     def test_determine_available_memory_normal_case(
         self,
         mock_logger,
@@ -551,6 +584,7 @@ class TestNPUWorker(TestBase):
         mock_torch_empty_cache,
         mock_torch_reset_peak_memory_stats,
         mock_memory_profiling,
+        mock_profile_run,
     ):
         """Test determine_available_memory normal case (no non-torch memory allocation)"""
         from vllm_ascend.worker.worker import NPUWorker
@@ -593,7 +627,7 @@ class TestNPUWorker(TestBase):
 
             result = worker.determine_available_memory()
 
-            worker.model_runner.profile_run.assert_called_once()
+            mock_profile_run.assert_called_once()
 
             # non_kv_cache_memory = non_torch_increase(1000) + torch_peak_increase(2000-0) + weights_memory(500) = 3500
             # result = requested_memory(8000) - non_kv_cache_memory(3500) = 4500
@@ -605,6 +639,7 @@ class TestNPUWorker(TestBase):
     @patch("torch.npu.empty_cache")
     @patch("torch_npu.npu.memory_stats")
     @patch("torch_npu.npu.mem_get_info")
+    @patch("vllm_ascend.worker.worker.NPUWorker._profile_run_with_memory_snapshot")
     def test_determine_available_memory_with_non_torch_allocations(
         self,
         mock_torch_mem_get_info,
@@ -612,6 +647,7 @@ class TestNPUWorker(TestBase):
         mock_torch_empty_cache,
         mock_torch_reset_peak_memory_stats,
         mock_memory_profiling,
+        mock_profile_run,
     ):
         """Test determine_available_memory with significant non-torch memory allocation"""
         from vllm_ascend.worker.worker import NPUWorker
@@ -661,8 +697,14 @@ class TestNPUWorker(TestBase):
     @patch("torch.npu.mem_get_info")
     @patch("torch.npu.reset_peak_memory_stats")
     @patch("torch.npu.empty_cache")
+    @patch("vllm_ascend.worker.worker.NPUWorker._profile_run_with_memory_snapshot")
     def test_determine_available_memory_memory_profiling_error(
-        self, mock_torch_empty_cache, mock_torch_reset_peak_memory_stats, mock_torch_mem_get_info, mock_memory_profiling
+        self,
+        mock_torch_empty_cache,
+        mock_torch_reset_peak_memory_stats,
+        mock_torch_mem_get_info,
+        mock_memory_profiling,
+        mock_profile_run,
     ):
         """Test determine_available_memory throws exception on memory profiling error"""
         from vllm_ascend.worker.worker import NPUWorker
@@ -707,6 +749,7 @@ class TestNPUWorker(TestBase):
     @patch("torch.npu.empty_cache")
     @patch("torch_npu.npu.memory_stats")
     @patch("torch_npu.npu.mem_get_info")
+    @patch("vllm_ascend.worker.worker.NPUWorker._profile_run_with_memory_snapshot")
     def test_determine_available_memory_negative_result(
         self,
         mock_torch_mem_get_info,
@@ -714,6 +757,7 @@ class TestNPUWorker(TestBase):
         mock_torch_empty_cache,
         mock_torch_reset_peak_memory_stats,
         mock_memory_profiling,
+        mock_profile_run,
     ):
         """Test determine_available_memory returns 0 when result is negative"""
         from vllm_ascend.worker.worker import NPUWorker
