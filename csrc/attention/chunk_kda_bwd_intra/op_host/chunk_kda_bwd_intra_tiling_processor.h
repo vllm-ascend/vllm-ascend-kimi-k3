@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <exe_graph/runtime/storage_shape.h>
+#include <exe_graph/runtime/tensor.h>
 #include <register/op_impl_registry.h>
 #include "tiling_base/tiling_templates_registry.h"
 
@@ -47,16 +48,16 @@ constexpr int64_t KDA_BWD_LAYOUT_VARLEN_TND = 1;
 
 struct ChunkKdaBwdIntraTilingContext {
     const char *nodeName;
-    const gert::StorageShape *qShape;
-    const gert::StorageShape *kShape;
-    const gert::StorageShape *gkShape;
-    const gert::StorageShape *betaShape;
-    const gert::StorageShape *dAqkShape;
-    const gert::StorageShape *dAkkShape;
-    const gert::StorageShape *dqShape;
-    const gert::StorageShape *dkShape;
-    const gert::StorageShape *dbShape;
-    const gert::StorageShape *dgShape;
+    const gert::Tensor *qTensor;
+    const gert::Tensor *kTensor;
+    const gert::Tensor *gkTensor;
+    const gert::Tensor *betaTensor;
+    const gert::Tensor *dAqkTensor;
+    const gert::Tensor *dAkkTensor;
+    const gert::Tensor *dqTensor;
+    const gert::Tensor *dkTensor;
+    const gert::Tensor *dbTensor;
+    const gert::Tensor *dgTensor;
     ge::DataType dataType;
     int64_t chunkSize;
     bool safeGate;
@@ -101,25 +102,28 @@ public:
     }
 
 private:
+    // The kernel contract is defined by the logical ND shape. In the ACLNN
+    // path, GetRequiredInputShape() may expose a flattened compile-time shape,
+    // so validate dimensions through the runtime input tensor instead.
     static uint64_t Align512(uint64_t value)
     {
         return (value + 511U) / 512U * 512U;
     }
 
-    ge::graphStatus RequireRank(const gert::StorageShape *shape, size_t rank, const char *name) const
+    ge::graphStatus RequireRank(const gert::Tensor *tensor, size_t rank, const char *name) const
     {
-        OP_CHECK_IF(shape == nullptr, OP_LOGE(ctx_.nodeName, "%s is required.", name),
+        OP_CHECK_IF(tensor == nullptr, OP_LOGE(ctx_.nodeName, "%s is required.", name),
                     return ge::GRAPH_FAILED);
-        OP_CHECK_IF(shape->GetStorageShape().GetDimNum() != rank,
+        OP_CHECK_IF(tensor->GetOriginShape().GetDimNum() != rank,
                     OP_LOGE(ctx_.nodeName, "%s must be rank %zu.", name, rank),
                     return ge::GRAPH_FAILED);
         return ge::GRAPH_SUCCESS;
     }
 
-    bool SameShape(const gert::StorageShape *lhs, const gert::StorageShape *rhs) const
+    bool SameShape(const gert::Tensor *lhs, const gert::Tensor *rhs) const
     {
-        const gert::Shape a = lhs->GetStorageShape();
-        const gert::Shape b = rhs->GetStorageShape();
+        const gert::Shape a = lhs->GetOriginShape();
+        const gert::Shape b = rhs->GetOriginShape();
         if (a.GetDimNum() != b.GetDimNum()) {
             return false;
         }
@@ -150,29 +154,32 @@ private:
 
         const bool isVarLen = ctx_.layoutMode == KDA_BWD_LAYOUT_VARLEN_TND;
 
-        OP_CHECK_IF(ctx_.qShape == nullptr,
+        OP_CHECK_IF(ctx_.qTensor == nullptr,
                     OP_LOGE(ctx_.nodeName, "q is required."),
                     return ge::GRAPH_FAILED);
-        const gert::StorageShape *vectorShapes[] = {
-            ctx_.qShape, ctx_.kShape, ctx_.gkShape, ctx_.dAqkShape, ctx_.dAkkShape,
-            ctx_.dqShape, ctx_.dkShape, ctx_.dgShape
+        const gert::Tensor *vectorTensors[] = {
+            ctx_.qTensor, ctx_.kTensor, ctx_.gkTensor, ctx_.dAqkTensor,
+            ctx_.dAkkTensor, ctx_.dqTensor, ctx_.dkTensor, ctx_.dgTensor
         };
-        const gert::Shape q = ctx_.qShape->GetStorageShape();
+        const gert::Shape q = ctx_.qTensor->GetOriginShape();
         const size_t qRank = q.GetDimNum();
         OP_CHECK_IF((isVarLen && qRank != 3 && qRank != 4) ||
                         (!isVarLen && qRank != 4),
-                    OP_LOGE(ctx_.nodeName, "q rank does not match layout_mode."),
+                    OP_LOGE(ctx_.nodeName,
+                            "logical q rank %zu does not match layout_mode %ld "
+                            "[input-tensor-shape-v2].",
+                            qRank, ctx_.layoutMode),
                     return ge::GRAPH_FAILED);
         const size_t vectorRank = isVarLen ? qRank : 4;
         const size_t scalarRank = vectorRank - 1;
         for (size_t i = 0; i < 8; ++i) {
             const char *names[] = {"q", "k", "gk", "dAqk", "dAkk", "dq", "dk", "dg"};
-            OP_CHECK_IF(RequireRank(vectorShapes[i], vectorRank, names[i]) != ge::GRAPH_SUCCESS, ,
+            OP_CHECK_IF(RequireRank(vectorTensors[i], vectorRank, names[i]) != ge::GRAPH_SUCCESS, ,
                         return ge::GRAPH_FAILED);
         }
-        OP_CHECK_IF(RequireRank(ctx_.betaShape, scalarRank, "beta") != ge::GRAPH_SUCCESS, ,
+        OP_CHECK_IF(RequireRank(ctx_.betaTensor, scalarRank, "beta") != ge::GRAPH_SUCCESS, ,
                     return ge::GRAPH_FAILED);
-        OP_CHECK_IF(RequireRank(ctx_.dbShape, scalarRank, "db") != ge::GRAPH_SUCCESS, ,
+        OP_CHECK_IF(RequireRank(ctx_.dbTensor, scalarRank, "db") != ge::GRAPH_SUCCESS, ,
                     return ge::GRAPH_FAILED);
 
         if (isVarLen) {
@@ -203,15 +210,17 @@ private:
                     OP_LOGE(ctx_.nodeName,
                             "varlen supports K=128; dense supports K=64/128/256."),
                     return ge::GRAPH_FAILED);
-        OP_CHECK_IF(!SameShape(ctx_.qShape, ctx_.kShape) || !SameShape(ctx_.qShape, ctx_.gkShape) ||
-                        !SameShape(ctx_.qShape, ctx_.dqShape) || !SameShape(ctx_.qShape, ctx_.dkShape) ||
-                        !SameShape(ctx_.qShape, ctx_.dgShape),
+        OP_CHECK_IF(!SameShape(ctx_.qTensor, ctx_.kTensor) ||
+                        !SameShape(ctx_.qTensor, ctx_.gkTensor) ||
+                        !SameShape(ctx_.qTensor, ctx_.dqTensor) ||
+                        !SameShape(ctx_.qTensor, ctx_.dkTensor) ||
+                        !SameShape(ctx_.qTensor, ctx_.dgTensor),
                     OP_LOGE(ctx_.nodeName, "q/k/gk/dq/dk/dg shapes must match."),
                     return ge::GRAPH_FAILED);
-        const gert::Shape beta = ctx_.betaShape->GetStorageShape();
-        const gert::Shape dAqk = ctx_.dAqkShape->GetStorageShape();
-        OP_CHECK_IF(!SameShape(ctx_.betaShape, ctx_.dbShape) ||
-                        !SameShape(ctx_.dAqkShape, ctx_.dAkkShape),
+        const gert::Shape beta = ctx_.betaTensor->GetOriginShape();
+        const gert::Shape dAqk = ctx_.dAqkTensor->GetOriginShape();
+        OP_CHECK_IF(!SameShape(ctx_.betaTensor, ctx_.dbTensor) ||
+                        !SameShape(ctx_.dAqkTensor, ctx_.dAkkTensor),
                     OP_LOGE(ctx_.nodeName, "beta/db and dAqk/dAkk shapes must match."),
                     return ge::GRAPH_FAILED);
         if (isVarLen) {
