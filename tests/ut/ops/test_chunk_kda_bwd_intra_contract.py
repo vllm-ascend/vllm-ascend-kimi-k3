@@ -94,3 +94,30 @@ def test_aclnn_contract_preserves_four_gradient_outputs():
     assert "safe_gate=false is reserved but not supported in v1." in source
     assert "varlen supports K=128; dense supports K=64/128/256." in source
     assert "chunk_indices must use canonical sequence-major order." in source
+
+
+def test_tnd_aclnn_path_builds_rank4_views_before_custom_op_launch():
+    source = _read(OP_ROOT / "op_host/op_api/aclnn_chunk_kda_bwd_intra.cpp")
+
+    assert '#include "aclnn_kernels/reshape.h"' in source
+    assert "if (parsedLayout == Layout::TND)" in source
+    assert "MakeShape({1, seqlen, headNum, headDim})" in source
+    assert "MakeShape({1, seqlen, headNum})" in source
+    assert "MakeShape({1, seqlen, headNum, chunkSize})" in source
+    for tensor in (
+        "q",
+        "k",
+        "gk",
+        "beta",
+        "dAqk",
+        "dAkk",
+        "dq",
+        "dk",
+        "db",
+        "dg",
+        "dqOut",
+        "dkOut",
+        "dbOut",
+        "dgOut",
+    ):
+        assert f"l0op::Reshape({tensor}," in source

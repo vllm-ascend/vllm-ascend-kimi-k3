@@ -14,6 +14,7 @@
 
 #include <cstring>
 #include <initializer_list>
+#include "aclnn_kernels/reshape.h"
 #include "aclnn_kernels/common/op_error_check.h"
 #include "opdev/common_types.h"
 #include "opdev/make_op_executor.h"
@@ -301,7 +302,36 @@ extern "C" aclnnStatus aclnnChunkKdaBwdIntraGetWorkspaceSize(
     const aclTensor *dbOutBns = dbOut;
     const aclTensor *dgOutBnsd = dgOut;
 
-    if (!isInternalLayout) {
+    if (parsedLayout == Layout::TND) {
+        const op::Shape vectorShape =
+            MakeShape({1, seqlen, headNum, headDim});
+        const op::Shape scalarShape =
+            MakeShape({1, seqlen, headNum});
+        const op::Shape matrixShape =
+            MakeShape({1, seqlen, headNum, chunkSize});
+        qBnsd = l0op::Reshape(q, vectorShape, executorPtr);
+        kBnsd = l0op::Reshape(k, vectorShape, executorPtr);
+        gkBnsd = l0op::Reshape(gk, vectorShape, executorPtr);
+        betaBns = l0op::Reshape(beta, scalarShape, executorPtr);
+        dAqkBnst = l0op::Reshape(dAqk, matrixShape, executorPtr);
+        dAkkBnst = l0op::Reshape(dAkk, matrixShape, executorPtr);
+        dqBnsd = l0op::Reshape(dq, vectorShape, executorPtr);
+        dkBnsd = l0op::Reshape(dk, vectorShape, executorPtr);
+        dbBns = l0op::Reshape(db, scalarShape, executorPtr);
+        dgBnsd = l0op::Reshape(dg, vectorShape, executorPtr);
+        dqOutBnsd = l0op::Reshape(dqOut, vectorShape, executorPtr);
+        dkOutBnsd = l0op::Reshape(dkOut, vectorShape, executorPtr);
+        dbOutBns = l0op::Reshape(dbOut, scalarShape, executorPtr);
+        dgOutBnsd = l0op::Reshape(dgOut, vectorShape, executorPtr);
+        CHECK_RET(qBnsd != nullptr && kBnsd != nullptr && gkBnsd != nullptr &&
+                      betaBns != nullptr && dAqkBnst != nullptr &&
+                      dAkkBnst != nullptr && dqBnsd != nullptr &&
+                      dkBnsd != nullptr && dbBns != nullptr &&
+                      dgBnsd != nullptr && dqOutBnsd != nullptr &&
+                      dkOutBnsd != nullptr && dbOutBns != nullptr &&
+                      dgOutBnsd != nullptr,
+                  ACLNN_ERR_INNER_NULLPTR);
+    } else if (!isInternalLayout) {
         const op::Shape vectorShape = MakeShape({batch, headNum, seqlen, headDim});
         const op::Shape scalarShape = MakeShape({batch, headNum, seqlen});
         const op::Shape matrixShape = MakeShape({batch, headNum, seqlen, chunkSize});
