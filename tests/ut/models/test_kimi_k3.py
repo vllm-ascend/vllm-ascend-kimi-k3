@@ -441,7 +441,10 @@ def test_kimi_k3_text_loader_maps_real_checkpoint_names_to_shards():
             torch.tensor([32.0]),
         ),
         ("model.layers.0.self_attn.g_proj.weight", torch.tensor([40.0])),
-        ("model.layers.4.mlp.gate_proj.weight", torch.tensor([50.0])),
+        (
+            "layers.68.block_sparse_moe.experts.w13_scale_bias",
+            torch.tensor([50.0]),
+        ),
     ]
 
     loaded = model.load_weights(iter(weights))

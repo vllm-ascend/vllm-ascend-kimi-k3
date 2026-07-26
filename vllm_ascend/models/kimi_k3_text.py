@@ -85,7 +85,10 @@ def _get_kimi_k3_num_loaded_layers(
 
 def _get_decoder_layer_idx_from_weight_name(weight_name: str) -> int | None:
     """Extract a K3 decoder-layer index from an inner or VL checkpoint key."""
-    layer_prefix = "model.layers."
+    # AutoWeightsLoader removes the child-module prefix before delegating to
+    # KimiK3TextModel.load_weights, so the same tensor can arrive as either
+    # ``model.layers.<idx>`` or ``layers.<idx>``.
+    layer_prefix = "layers."
     prefix_idx = weight_name.find(layer_prefix)
     if prefix_idx < 0:
         return None
