@@ -150,7 +150,7 @@ class TestUnifiedApplyMlpRequest(unittest.TestCase):
         torch.testing.assert_close(second_call.kwargs["x"][0], expected_activation, rtol=0, atol=0)
         mock_swiglu.assert_not_called()
 
-    def test_w4a16_mxfp4_situ_ignores_dispatch_scale_and_uses_two_grouped_matmuls(self):
+    def test_w4a16_mxfp4_situ_uses_a5_situ_glu_between_grouped_matmuls(self):
         hidden_states = torch.randn(2, 4, dtype=torch.bfloat16)
         gate_up_out = torch.tensor(
             [[-8.0, 1.0, -30.0, 40.0], [0.5, 7.0, -2.0, 3.0]],
@@ -164,8 +164,12 @@ class TestUnifiedApplyMlpRequest(unittest.TestCase):
         expected_activation = (4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate) * (25.0 * torch.tanh(up / 25.0))).to(
             gate_up_out.dtype
         )
+        custom_ops = SimpleNamespace(
+            situ_glu=MagicMock(return_value=expected_activation),
+        )
 
         with (
+            patch.object(moe_mlp_module.torch.ops, "_C_ascend", custom_ops),
             patch(
                 "vllm_ascend.ops.fused_moe.moe_mlp.torch_npu.npu_grouped_matmul",
                 return_value=[gate_up_out],
@@ -209,6 +213,12 @@ class TestUnifiedApplyMlpRequest(unittest.TestCase):
         self.assertIsNone(mock_gmm2.call_args.kwargs["per_token_scale"])
         self.assertEqual(mock_gmm2.call_args.kwargs["mxfp_quant_dtype"], QuantType.W4A16MXFP4)
         self.assertEqual(mock_gmm1.call_count, 1)
+        situ_call = custom_ops.situ_glu.call_args
+        self.assertIs(situ_call.args[0], gate_up_out)
+        self.assertEqual(situ_call.kwargs["dim"], -1)
+        self.assertEqual(situ_call.kwargs["beta"], 4.0)
+        self.assertEqual(situ_call.kwargs["linear_beta"], 25.0)
+        self.assertTrue(situ_call.kwargs["activate_left"])
         mock_fused_gmm.assert_not_called()
         mock_swiglu.assert_not_called()
 
