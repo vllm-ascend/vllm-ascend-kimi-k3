@@ -368,8 +368,6 @@ class KimiK3MultiModalProjector(nn.Module):
         hidden_states = self.act(hidden_states)
         hidden_states = self.linear_2(hidden_states)[0]
         hidden_states = self.post_norm(hidden_states)
-        # if self.rot_proj is not None:
-        #     hidden_states = self.rot_proj(hidden_states)[0]
         if self.use_rot_proj:
             assert self.rot_proj is not None
             hidden_states = self.rot_proj(hidden_states)[0]
