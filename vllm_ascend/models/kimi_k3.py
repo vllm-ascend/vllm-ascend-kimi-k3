@@ -380,7 +380,19 @@ class AscendKimiK3ForConditionalGeneration(
         # checkpoint tensor.
         skip_prefixes = [] if self.mm_projector.rot_proj is not None else ["mm_projector.rot_proj."]
         loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded_weights = loader.load_weights(
+                weights,
+                mapper=self.hf_to_vllm_mapper,
+            )
+        rot_proj_weight_names = {
+            name
+            for name, _ in self.named_parameters()
+            if ".rot_proj." in f".{name}."
+        }
+        self.mm_projector.use_rot_proj = bool(
+            rot_proj_weight_names & loaded_weights
+        )
+        return loaded_weights
 
 
 __all__ = ["AscendKimiK3ForConditionalGeneration"]

@@ -350,7 +350,10 @@ class KimiK3MultiModalProjector(nn.Module):
         # embeddings fold this matrix into their input projection, but the
         # vision path ends in RMSNorm, so the rotation must remain explicit.
         self.rot_proj: ReplicatedLinear | None = None
-        if get_ascend_device_type() == AscendDeviceType.A3:
+        if get_ascend_device_type() in {
+                AscendDeviceType.A3,
+                AscendDeviceType.A5,
+            }:
             self.rot_proj = ReplicatedLinear(
                 config.text_hidden_size,
                 config.text_hidden_size,
@@ -365,7 +368,10 @@ class KimiK3MultiModalProjector(nn.Module):
         hidden_states = self.act(hidden_states)
         hidden_states = self.linear_2(hidden_states)[0]
         hidden_states = self.post_norm(hidden_states)
-        if self.rot_proj is not None:
+        # if self.rot_proj is not None:
+        #     hidden_states = self.rot_proj(hidden_states)[0]
+        if self.use_rot_proj:
+            assert self.rot_proj is not None
             hidden_states = self.rot_proj(hidden_states)[0]
         return hidden_states
 
