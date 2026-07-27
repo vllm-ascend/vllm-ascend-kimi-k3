@@ -20,8 +20,24 @@ from vllm_ascend.attention.mla_v1 import (
     ChunkedContextMetadata,
     DecodeMLAPreprocessResult,
     PrefillMLAPreprocessResult,
+    _use_ring_mla_prefill,
 )
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
+
+
+class TestRingMLAPrefillSelection(TestBase):
+    @patch("vllm_ascend.attention.mla_v1.get_ascend_device_type")
+    def test_a2_a3_use_ring_mla_and_a5_keeps_fia(self, mock_get_ascend_device_type):
+        from vllm_ascend.attention.mla_v1 import AscendDeviceType
+
+        for device_type, expected in (
+            (AscendDeviceType.A2, True),
+            (AscendDeviceType.A3, True),
+            (AscendDeviceType.A5, False),
+        ):
+            with self.subTest(device_type=device_type):
+                mock_get_ascend_device_type.return_value = device_type
+                self.assertEqual(_use_ring_mla_prefill(), expected)
 
 
 class TestAscendMLABackend(TestBase):
@@ -456,6 +472,23 @@ class TestAscendMLAMetadataBuilder(TestBase):
 
         result = AscendMLAMetadataBuilder.determine_chunked_prefill_workspace_size(mock_vllm_config)
         self.assertGreater(result, 0)
+
+    def test_get_prefill_attn_mask(self):
+        builder = object.__new__(AscendMLAMetadataBuilder)
+        builder.model_config = MagicMock()
+        builder.attn_mask_builder = MagicMock()
+        ring_mask = object()
+        fia_mask = object()
+        builder.attn_mask_builder.get_final_mla_mask.return_value = ring_mask
+        builder.attn_mask_builder.get_splitfuse_attn_mask.return_value = fia_mask
+
+        builder.use_ring_mla_prefill = True
+        self.assertIs(builder.get_prefill_attn_mask(), ring_mask)
+        builder.attn_mask_builder.get_final_mla_mask.assert_called_once_with(builder.model_config)
+
+        builder.use_ring_mla_prefill = False
+        self.assertIs(builder.get_prefill_attn_mask(), fia_mask)
+        builder.attn_mask_builder.get_splitfuse_attn_mask.assert_called_once_with()
 
     def test_get_cudagraph_support(self):
         mock_vllm_config = MagicMock()
@@ -1797,6 +1830,7 @@ class TestAscendMLAImpl(TestBase):
     @patch("torch_npu.npu_fused_infer_attention_score")
     @patch("torch_npu.npu_attention_update")
     def test__forward_prefill(self, mock_npu_attention_update, mock_fia, mock_device_operator):
+        self.impl.use_ring_mla_prefill = False
         batch_size = 2
 
         # create input tensors
@@ -1845,6 +1879,49 @@ class TestAscendMLAImpl(TestBase):
         self.assertEqual(result.shape[0], batch_size)
         self.assertEqual(result.shape[1], self.impl.num_heads * self.impl.v_head_dim)
 
+    @patch("torch_npu.npu_fused_infer_attention_score")
+    @patch("torch_npu.atb.npu_ring_mla")
+    def test_forward_prefill_a2_a3_uses_native_heads_without_padding(self, mock_ring_mla, mock_fia):
+        self.impl.use_ring_mla_prefill = True
+        self.impl.num_heads = 96
+        self.impl.num_heads_padded = 128
+        self.impl.head_padding = 32
+        batch_size = 2
+        q_nope = torch.randn(batch_size, self.impl.num_heads, self.impl.qk_nope_head_dim)
+        q_pe = torch.randn(batch_size, self.impl.num_heads, self.impl.qk_rope_head_dim)
+        k_nope = torch.randn(batch_size, self.impl.num_heads, self.impl.qk_nope_head_dim)
+        k_pe = torch.randn(batch_size, self.impl.num_heads, self.impl.qk_rope_head_dim)
+        value = torch.randn(batch_size, self.impl.num_heads, self.impl.v_head_dim)
+        kv_c_and_k_pe_cache = [torch.randn(10, 1, 1, 192), torch.randn(10, 1, 1, 32)]
+        ring_mask = torch.randn(512, 512)
+        query_lens = torch.tensor([1, 1], dtype=torch.int32)
+        prefill_metadata = MagicMock(
+            attn_mask=ring_mask,
+            query_lens=query_lens,
+            chunked_context=None,
+        )
+        attn_metadata = MagicMock(prefill=prefill_metadata)
+
+        result = self.impl._forward_prefill(
+            q_nope,
+            q_pe,
+            k_nope,
+            k_pe,
+            value,
+            kv_c_and_k_pe_cache,
+            attn_metadata,
+        )
+
+        mock_ring_mla.assert_called_once()
+        mock_fia.assert_not_called()
+        call_kwargs = mock_ring_mla.call_args.kwargs
+        self.assertIs(call_kwargs["mask"], ring_mask)
+        self.assertIs(call_kwargs["seqlen"], query_lens)
+        self.assertEqual(call_kwargs["head_num"], self.impl.num_heads)
+        self.assertEqual(call_kwargs["mask_type"], "mask_type_triu")
+        self.assertEqual(call_kwargs["calc_type"], "calc_type_first_ring")
+        self.assertEqual(result.shape, (batch_size, self.impl.num_heads * self.impl.v_head_dim))
+
     @patch("vllm_ascend.attention.mla_v1.get_current_vllm_config")
     @patch("vllm_ascend.attention.mla_v1.DeviceOperator")
     @patch("torch_npu.npu_fused_infer_attention_score")
@@ -1882,6 +1959,7 @@ class TestAscendMLAImpl(TestBase):
             kv_sharing_target_layer_name=None,
             **kwargs,
         )
+        impl.use_ring_mla_prefill = False
         batch_size = 2
         q_nope = torch.randn(batch_size, num_heads, impl.qk_nope_head_dim)
         q_pe = torch.randn(batch_size, num_heads, impl.qk_rope_head_dim)
@@ -2160,6 +2238,7 @@ class TestAscendMLAImpl(TestBase):
     @patch("torch_npu.npu_attention_update")
     @patch("torch_npu.npu_fused_infer_attention_score")
     def test_compute_prefill_context(self, mock_fia, mock_update, mock_load):
+        self.impl.use_ring_mla_prefill = False
         S, N, D, VD = 2, self.impl.num_heads, self.impl.qk_head_dim, self.impl.v_head_dim
         _, AND = self.impl.qk_rope_head_dim, self.impl.qk_nope_head_dim
         latent_kv_dim = self.impl.kv_lora_rank
@@ -2203,6 +2282,67 @@ class TestAscendMLAImpl(TestBase):
 
         self.assertEqual(out.shape, prefix_out.shape)
 
+    @patch("vllm_ascend.attention.mla_v1.DeviceOperator.kv_cache_load")
+    @patch("torch_npu.npu_attention_update")
+    @patch("torch_npu.npu_fused_infer_attention_score")
+    @patch("torch_npu.atb.npu_ring_mla")
+    def test_compute_prefill_context_a2_a3_uses_ring_mla(
+        self,
+        mock_ring_mla,
+        mock_fia,
+        mock_update,
+        mock_load,
+    ):
+        self.impl.use_ring_mla_prefill = True
+        S, N, D, VD = 2, self.impl.num_heads, self.impl.qk_head_dim, self.impl.v_head_dim
+        latent_kv_dim = self.impl.kv_lora_rank
+        query = torch.randn(S, N, D)
+        q_nope = query[..., : self.impl.qk_nope_head_dim]
+        q_pe = query[..., self.impl.qk_nope_head_dim :]
+        kv_cache = [
+            torch.randn(100, 20, N, latent_kv_dim),
+            torch.randn(100, 20, N, self.impl.qk_rope_head_dim),
+        ]
+        prefix_out = torch.randn(S, N, VD)
+        prefix_lse = torch.randn(N, S)
+        self.impl.kv_b_proj.return_value = (torch.randn(8, N, self.impl.qk_nope_head_dim + VD),)
+        chunk_context = MagicMock(
+            seq_tot=[8],
+            chunk_seq_lens=[torch.tensor([8], dtype=torch.int32)],
+            chunk_seq_lens_npu=[torch.tensor([8], dtype=torch.int32)],
+            starts=[torch.tensor([0], dtype=torch.int32)],
+        )
+        prefill_metadata = MagicMock(
+            chunked_context=chunk_context,
+            query_lens=torch.tensor([S], dtype=torch.int32),
+            block_table=torch.randint(0, 100, (S, 4)),
+        )
+        ring_mask = torch.randn(512, 512)
+        metadata = MagicMock(prefill=prefill_metadata, attn_mask=ring_mask)
+
+        out, lse = self.impl._compute_prefill_context(
+            q_nope,
+            q_pe,
+            kv_cache,
+            self.impl.qk_rope_head_dim,
+            metadata,
+            prefix_out,
+            prefix_lse,
+        )
+
+        mock_load.assert_called_once()
+        mock_ring_mla.assert_called_once()
+        mock_fia.assert_not_called()
+        mock_update.assert_not_called()
+        call_kwargs = mock_ring_mla.call_args.kwargs
+        self.assertIs(call_kwargs["mask"], ring_mask)
+        self.assertIs(call_kwargs["pre_out"], prefix_out)
+        self.assertIs(call_kwargs["prev_lse"], prefix_lse)
+        self.assertEqual(call_kwargs["mask_type"], "no_mask")
+        self.assertEqual(call_kwargs["calc_type"], "calc_type_default")
+        self.assertIs(out, prefix_out)
+        self.assertIs(lse, prefix_lse)
+
     @patch("vllm_ascend.attention.mla_v1.get_current_vllm_config")
     @patch("torch_npu.atb.npu_paged_cache_load")
     @patch("torch_npu.npu_attention_update")
@@ -2243,6 +2383,7 @@ class TestAscendMLAImpl(TestBase):
             kv_sharing_target_layer_name=None,
             **kwargs,
         )
+        impl.use_ring_mla_prefill = False
         S, N, D, VD = 2, num_heads, impl.qk_head_dim, impl.v_head_dim
         latent_kv_dim = impl.kv_lora_rank
         num_blocks, block_size = 100, 20
