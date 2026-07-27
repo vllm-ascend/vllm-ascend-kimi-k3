@@ -238,6 +238,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "kda_layout_swap12"
         "store_kv_block"
         "store_kv_block_metadata"
+        "mla_prolog_v3"
     )
 
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
