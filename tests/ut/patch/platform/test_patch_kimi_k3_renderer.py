@@ -8,8 +8,10 @@ import pytest
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
 from vllm.entrypoints.serve.render.serving import OpenAIServingRender
+from vllm.exceptions import VLLMValidationError
 from vllm.renderers import registry as renderer_registry
 from vllm.renderers.params import ChatParams
+from vllm.tokenizers.registry import TokenizerRegistry
 
 from vllm_ascend.patch.platform import patch_kimi_k3_chat_params as chat_params_patch
 from vllm_ascend.patch.platform import patch_kimi_k3_renderer as renderer_patch
@@ -35,6 +37,10 @@ def _request(**kwargs):
     return ChatCompletionRequest(**defaults)
 
 
+def _tool(name: str):
+    return {"type": "function", "function": {"name": name, "parameters": {"type": "object"}}}
+
+
 def test_kimi_k3_renderer_is_selected_from_model_type(monkeypatch):
     original_attr = renderer_patch._ORIGINAL_TOKENIZER_ARGS_ATTR
     monkeypatch.setattr(
@@ -49,6 +55,17 @@ def test_kimi_k3_renderer_is_selected_from_model_type(monkeypatch):
     assert kimi_args[0] == "kimi_k3"
     assert other_args[0] == "hf"
     assert renderer_registry.RENDERER_REGISTRY.load_renderer_cls("kimi_k3") is KimiK3Renderer
+    assert TokenizerRegistry.load_tokenizer_cls("kimi_k3").__name__ == "CachedHfTokenizer"
+
+
+def test_kimi_k3_media_io_defaults_preserve_original_mode():
+    assert renderer_patch._merge_k3_media_io_kwargs(None) == {"image": {"image_mode": None}}
+    assert renderer_patch._merge_k3_media_io_kwargs({"image": {"image_mode": "RGB"}}) == {
+        "image": {"image_mode": "RGB"}
+    }
+    assert renderer_patch._merge_k3_media_io_kwargs({"image": {"rgba_background_color": (0, 0, 0)}}) == {
+        "image": {"image_mode": None, "rgba_background_color": (0, 0, 0)}
+    }
 
 
 def test_explicit_non_hf_tokenizer_mode_is_not_rewritten(monkeypatch):
@@ -109,7 +126,7 @@ def test_renderer_calls_tokenizer_python_encoder_without_jinja():
             "return_tensors": None,
             "return_dict": False,
             "thinking": False,
-            "tool_choice": "none",
+            "thinking_effort": "none",
             "response_format": {"type": "json_object"},
             "response_schema": {"type": "object"},
         }
@@ -117,6 +134,7 @@ def test_renderer_calls_tokenizer_python_encoder_without_jinja():
 
 
 def test_renderer_converts_developer_role_without_reordering_or_flattening():
+    tools = [_tool("lookup")]
     conversation = [
         {"role": "user", "content": "question"},
         {
@@ -125,7 +143,7 @@ def test_renderer_converts_developer_role_without_reordering_or_flattening():
                 {"type": "image"},
                 {"type": "text", "text": "developer policy"},
             ],
-            "tools": [],
+            "tools": tools,
         },
         {"role": "system", "content": "system policy"},
     ]
@@ -140,6 +158,7 @@ def test_renderer_converts_developer_role_without_reordering_or_flattening():
                 {"type": "image"},
                 {"type": "text", "text": "developer policy"},
             ],
+            "tools": tools,
         },
         {"role": "system", "content": "system policy"},
     ]
@@ -151,7 +170,7 @@ def test_renderer_converts_developer_role_without_reordering_or_flattening():
                 {"type": "image"},
                 {"type": "text", "text": "developer policy"},
             ],
-            "tools": [],
+            "tools": tools,
         },
         {"role": "system", "content": "system policy"},
     ]
@@ -275,10 +294,12 @@ def test_openai_chat_kwargs_are_scoped_by_served_model_type():
     kimi_kwargs = kimi_serving._effective_chat_template_kwargs(_request())
     other_kwargs = other_serving._effective_chat_template_kwargs(_request())
 
-    assert kimi_kwargs["thinking"] is True
-    assert kimi_kwargs["thinking_effort"] == "high"
-    assert "thinking" not in other_kwargs
-    assert "thinking_effort" not in other_kwargs
+    assert kimi_kwargs["enable_thinking"] is True
+    assert kimi_kwargs["reasoning_effort"] == "high"
+    assert kimi_kwargs["tools"] == []
+    assert other_kwargs["enable_thinking"] is True
+    assert other_kwargs["reasoning_effort"] == "high"
+    assert "tools" not in other_kwargs
 
 
 def test_server_defaults_cannot_override_typed_kimi_k3_tool_controls():
@@ -287,14 +308,8 @@ def test_server_defaults_cannot_override_typed_kimi_k3_tool_controls():
     serving.chat_template = None
     serving.chat_template_content_format = "auto"
     serving.default_chat_template_kwargs = {
-        "thinking": True,
         "tool_choice": "required",
-        "tools": [
-            {
-                "type": "function",
-                "function": {"name": "injected", "parameters": {"type": "object"}},
-            }
-        ],
+        "tools": [_tool("injected")],
     }
     request = _request(
         reasoning_effort="none",
@@ -304,21 +319,77 @@ def test_server_defaults_cannot_override_typed_kimi_k3_tool_controls():
 
     kwargs = serving._effective_chat_template_kwargs(request)
 
-    assert kwargs["thinking"] is False
+    assert kwargs["enable_thinking"] is False
     assert kwargs["tool_choice"] == "none"
     assert kwargs["tools"] == []
 
 
+def test_native_tool_kwargs_cannot_override_typed_controls():
+    request = _request(
+        tools=[_tool("calc")],
+        tool_choice="none",
+        chat_template_kwargs={
+            "tools": [_tool("injected")],
+            "tool_choice": "required",
+        },
+    )
+
+    chat_params_patch.prepare_kimi_k3_chat_template_kwargs(request)
+
+    assert [tool["function"]["name"] for tool in request.chat_template_kwargs["tools"]] == ["calc"]
+    assert request.chat_template_kwargs["tool_choice"] == "none"
+
+
+def test_named_tool_choice_keeps_all_declared_tools():
+    request = _request(
+        tools=[_tool("calc"), _tool("lookup")],
+        tool_choice={"type": "function", "function": {"name": "calc"}},
+    )
+
+    chat_params_patch.prepare_kimi_k3_chat_template_kwargs(request)
+
+    kwargs = request.chat_template_kwargs
+    assert [tool["function"]["name"] for tool in kwargs["tools"]] == ["calc", "lookup"]
+    assert kwargs["tool_choice"]["function"]["name"] == "calc"
+
+
+def test_renderer_native_thinking_controls_take_precedence():
+    calls = []
+
+    class RecordingTokenizer:
+        def apply_chat_template(self, **kwargs):
+            calls.append(kwargs)
+            return [11, 12]
+
+    renderer = object.__new__(KimiK3Renderer)
+    renderer.tokenizer = RecordingTokenizer()
+    renderer._apply_chat_template(
+        [{"role": "user", "content": "hello"}],
+        thinking=False,
+        enable_thinking=True,
+        thinking_effort="low",
+        reasoning_effort="high",
+    )
+
+    assert calls[0]["thinking"] is False
+    assert calls[0]["thinking_effort"] == "low"
+    assert "enable_thinking" not in calls[0]
+    assert "reasoning_effort" not in calls[0]
+
+
+@pytest.mark.parametrize("reasoning_effort", ["minimal", "medium", "xhigh"])
+def test_kimi_k3_rejects_unsupported_reasoning_effort(reasoning_effort):
+    renderer = object.__new__(KimiK3Renderer)
+
+    with pytest.raises(VLLMValidationError, match="supports low, high, and max"):
+        renderer._apply_chat_template(
+            [{"role": "user", "content": "hello"}],
+            reasoning_effort=reasoning_effort,
+        )
+
+
 def test_auto_tool_choice_survives_vllm_default_merging():
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "get_time",
-                "parameters": {"type": "object"},
-            },
-        }
-    ]
+    tools = [_tool("get_time")]
     request = _request(
         tools=tools,
         tool_choice="auto",
@@ -373,13 +444,13 @@ def test_auto_tool_choice_survives_vllm_default_merging():
 
 
 @pytest.mark.parametrize(
-    ("model_type", "expected_thinking"),
-    [("kimi_k3", True), ("other", None)],
+    ("model_type", "expected_prepared"),
+    [("kimi_k3", True), ("other", False)],
 )
 def test_render_server_prepares_only_kimi_k3_requests(
     monkeypatch,
     model_type: str,
-    expected_thinking: bool | None,
+    expected_prepared: bool,
 ):
     async def original_render_chat(self, request, *, skip_mm_cache=False):
         del self, skip_mm_cache
@@ -395,8 +466,10 @@ def test_render_server_prepares_only_kimi_k3_requests(
 
     kwargs = asyncio.run(serving.render_chat(_request()))
 
-    assert kwargs.get("thinking") is expected_thinking
-    if model_type == "kimi_k3":
+    assert ("tools" in kwargs) is expected_prepared
+    if expected_prepared:
+        assert kwargs["tools"] == []
+        assert kwargs["tool_choice"] == "none"
         request = _request()
         asyncio.run(serving.render_chat(request))
         assert request.skip_special_tokens is False

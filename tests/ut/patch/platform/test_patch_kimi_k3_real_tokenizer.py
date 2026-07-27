@@ -7,28 +7,30 @@ from pathlib import Path
 import pytest
 from transformers import AutoTokenizer
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+from vllm.parser import ParserManager
 from vllm.tokenizers.detokenizer_utils import detokenize_incrementally
 
-from vllm_ascend.patch.platform.patch_kimi_k3_parsers import (
-    ARGUMENT_END,
-    CALL_END,
-    MESSAGE_END,
-    RESPONSE_END,
-    RESPONSE_START,
-    THINK_END,
-    TOOLS_END,
-    TOOLS_START,
-    KimiK3Parser,
-)
 from vllm_ascend.patch.platform.patch_kimi_k3_renderer import (
     KIMI_K3_IMAGE_PROMPT,
 )
+
+OPEN = "<|open|>"
+CLOSE = "<|close|>"
+SEP = "<|sep|>"
+THINK_END = f"{CLOSE}think{SEP}"
+RESPONSE_START = f"{OPEN}response{SEP}"
+RESPONSE_END = f"{CLOSE}response{SEP}"
+TOOLS_START = f"{OPEN}tools{SEP}"
+TOOLS_END = f"{CLOSE}tools{SEP}"
+CALL_END = f"{CLOSE}call{SEP}"
+ARGUMENT_END = f"{CLOSE}argument{SEP}"
+MESSAGE_END = f"{CLOSE}message{SEP}"
 
 _TOKENIZER_PATH_ENV = "KIMI_K3_TOKENIZER_PATH"
 _KIMI_K3_TOKENIZER_FILE_SHA256 = {
     "tiktoken.model": "b6c497a7469b33ced9c38afb1ad6e47f03f5e5dc05f15930799210ec050c5103",
     "tokenization_kimi.py": "f28ea66e2d862a2a5814970b2ce40c2f7d8296ff09aed90a7e7def689b906944",
-    "encoding_k3.py": "c3869cdb7c5a81b1ee621e55ba589d8f3ffae83063c1085571ee96e2feb826a8",
+    "encoding_k3.py": "b9cb7ae100fed34b9337f80dacee5abbf7e261fe9b74bc0e76366701d46f5333",
     "tokenizer_config.json": "5d0803c94db9cd78763499e0956c95fd5a225c14a727e5a6cf5db3f96f010a6e",
 }
 
@@ -87,6 +89,21 @@ def _incremental_decode(tokenizer, token_ids, *, spaces_between_special_tokens):
     )
 
 
+def _parser(tokenizer, tools=None, *, thinking: bool):
+    parser_cls = ParserManager.get_parser(
+        tool_parser_name="kimi_k3",
+        reasoning_parser_name="kimi_k3",
+        enable_auto_tools=True,
+        model_name="kimi-k3",
+    )
+    assert parser_cls is not None
+    return parser_cls(
+        tokenizer,
+        tools,
+        chat_template_kwargs={"thinking": thinking},
+    )
+
+
 def test_real_incremental_detokenizer_preserves_adjacent_xtml_markers(
     real_kimi_k3_tokenizer,
 ):
@@ -132,9 +149,9 @@ def test_real_incremental_detokenizer_reconstructs_thinking_chat_response(
         messages=[{"role": "user", "content": "answer"}],
         reasoning_effort="max",
     )
-    parser = KimiK3Parser(
+    parser = _parser(
         real_kimi_k3_tokenizer,
-        chat_template_kwargs={"thinking": True},
+        thinking=True,
     )
     reasoning_parts: list[str] = []
     content_parts: list[str] = []
@@ -206,10 +223,10 @@ def test_real_incremental_detokenizer_extracts_bfcl_native_tool_call(
         tool_choice="auto",
         reasoning_effort="none",
     )
-    parser = KimiK3Parser(
+    parser = _parser(
         real_kimi_k3_tokenizer,
         tools,
-        chat_template_kwargs={"thinking": False},
+        thinking=False,
     )
     emitted_calls = []
     content_parts: list[str] = []
