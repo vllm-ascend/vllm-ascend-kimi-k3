@@ -209,12 +209,11 @@ ge::graphStatus MlaPrologTilingCheck::CheckDims() const
                 OP_LOGE_FOR_INVALID_VALUE(context_.opName, "He", std::to_string(baseShapeInfo_.heSize),
                                           ConvertContainerToStringV3(supportedHeSize)),
                 return ge::GRAPH_FAILED);
-    // TEMP: allow N=96 for model-native headNum accuracy bring-up.
-    // const std::set<uint32_t> supportedNSize{1U, 2U, 4U, 8U, 16U, 32U, 64U, 96U, 128U};
-    // OP_CHECK_IF((supportedNSize.find(baseShapeInfo_.nSize) == supportedNSize.end()),
-    //             OP_LOGE_FOR_INVALID_VALUE(context_.opName, "N", std::to_string(baseShapeInfo_.nSize),
-    //                                       ConvertContainerToStringV3(supportedNSize)),
-                // return ge::GRAPH_FAILED);
+
+    OP_CHECK_IF(baseShapeInfo_.nSize < 1U || baseShapeInfo_.nSize > 128U,
+                OP_LOGE_FOR_INVALID_VALUE(context_.opName, "N", std::to_string(baseShapeInfo_.nSize),
+                                          "N size should be within [1, 128]"),
+                return ge::GRAPH_FAILED);
     OP_CHECK_IF(baseShapeInfo_.hckvSize != HCKV_SIZE,
                 OP_LOGE_FOR_INVALID_VALUE(context_.opName, "Hckv", std::to_string(baseShapeInfo_.hckvSize),
                                           std::to_string(HCKV_SIZE)),
