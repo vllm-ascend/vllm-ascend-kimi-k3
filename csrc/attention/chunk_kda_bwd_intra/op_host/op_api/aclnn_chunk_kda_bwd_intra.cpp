@@ -302,13 +302,17 @@ extern "C" aclnnStatus aclnnChunkKdaBwdIntraGetWorkspaceSize(
     const aclTensor *dbOutBns = dbOut;
     const aclTensor *dgOutBnsd = dgOut;
 
-    if (parsedLayout == Layout::TND) {
+    // Torch 2.10 can expose flattened storage descriptors to the generated
+    // custom-op tiling path even when the public tensor view is rank 4. Build
+    // explicit zero-copy internal-layout views for both TND and BNSD so tiling
+    // always observes the rank and dimensions required by the kernel contract.
+    if (parsedLayout == Layout::TND || parsedLayout == Layout::BNSD) {
         const op::Shape vectorShape =
-            MakeShape({1, seqlen, headNum, headDim});
+            MakeShape({batch, headNum, seqlen, headDim});
         const op::Shape scalarShape =
-            MakeShape({1, seqlen, headNum});
+            MakeShape({batch, headNum, seqlen});
         const op::Shape matrixShape =
-            MakeShape({1, seqlen, headNum, chunkSize});
+            MakeShape({batch, headNum, seqlen, chunkSize});
         qBnsd = l0op::Reshape(q, vectorShape, executorPtr);
         kBnsd = l0op::Reshape(k, vectorShape, executorPtr);
         gkBnsd = l0op::Reshape(gk, vectorShape, executorPtr);

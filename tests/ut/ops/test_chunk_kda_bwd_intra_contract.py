@@ -96,14 +96,17 @@ def test_aclnn_contract_preserves_four_gradient_outputs():
     assert "chunk_indices must use canonical sequence-major order." in source
 
 
-def test_tnd_aclnn_path_builds_rank4_views_before_custom_op_launch():
+def test_internal_layout_aclnn_paths_build_rank4_views_before_custom_op_launch():
     source = _read(OP_ROOT / "op_host/op_api/aclnn_chunk_kda_bwd_intra.cpp")
 
     assert '#include "aclnn_kernels/reshape.h"' in source
-    assert "if (parsedLayout == Layout::TND)" in source
-    assert "MakeShape({1, seqlen, headNum, headDim})" in source
-    assert "MakeShape({1, seqlen, headNum})" in source
-    assert "MakeShape({1, seqlen, headNum, chunkSize})" in source
+    assert (
+        "if (parsedLayout == Layout::TND || parsedLayout == Layout::BNSD)"
+        in source
+    )
+    assert "MakeShape({batch, headNum, seqlen, headDim})" in source
+    assert "MakeShape({batch, headNum, seqlen})" in source
+    assert "MakeShape({batch, headNum, seqlen, chunkSize})" in source
     for tensor in (
         "q",
         "k",
