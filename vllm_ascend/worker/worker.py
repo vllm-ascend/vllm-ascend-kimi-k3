@@ -20,6 +20,7 @@
 import copy
 import gc
 import logging
+from pathlib import Path
 from types import NoneType
 
 import torch
@@ -84,6 +85,9 @@ torch_non_c_binding_in_graph_functions_npu = dict.fromkeys(
 )  # noqa: E402
 torch_non_c_binding_in_graph_functions_npu["torch.npu.stream"] = TorchInGraphFunctionVariable  # noqa: E402
 torch._dynamo.trace_rules.torch_name_rule_map.append(torch_non_c_binding_in_graph_functions_npu)  # noqa: E402
+
+
+PROFILE_RUN_MEMORY_SNAPSHOT_DIR = Path("/mnt/weight/images/lala_tmp")
 
 
 class NPUWorker(WorkerBase):
@@ -392,6 +396,50 @@ class NPUWorker(WorkerBase):
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
+    def _profile_run_with_memory_snapshot(self) -> None:
+        """Run the model profile pass and dump the allocator state for debugging."""
+        from vllm.distributed.utils import get_worker_rank_suffix
+
+        rank_suffix = get_worker_rank_suffix(global_rank=self.rank)
+        snapshot_prefix = "problem_vLLM_profile_run_snapshot"
+        snapshot_name = f"{snapshot_prefix}_{rank_suffix}.pickle"
+        snapshot_path = PROFILE_RUN_MEMORY_SNAPSHOT_DIR / snapshot_name
+        memory_history_enabled = False
+
+        print("*" * 40, "start getting snapshot", "*" * 59)
+        try:
+            PROFILE_RUN_MEMORY_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+            torch_npu.npu.memory._record_memory_history(context="all", stacks="all")
+            memory_history_enabled = True
+        except Exception:
+            logger.exception("Unable to enable NPU memory history for profile run.")
+
+        try:
+            free_npu_memory, total_npu_memory = torch.npu.mem_get_info()
+            logger.info(
+                "Profile run memory before forward: free %.2f GiB / total %.2f GiB.",
+                free_npu_memory / GiB_bytes,
+                total_npu_memory / GiB_bytes,
+            )
+        except Exception:
+            logger.exception("Unable to query NPU memory before profile run.")
+
+        try:
+            self.model_runner.profile_run()
+        finally:
+            if memory_history_enabled:
+                try:
+                    torch_npu.npu.memory._dump_snapshot(str(snapshot_path))
+                    logger.info("Profile run memory snapshot saved to %s.", snapshot_path)
+                except Exception:
+                    logger.exception("Unable to dump profile run memory snapshot to %s.", snapshot_path)
+                finally:
+                    try:
+                        torch_npu.npu.memory._record_memory_history(None)
+                    except Exception:
+                        logger.exception("Unable to disable NPU memory history after profile run.")
+            print("********************************************************end snapshot")
+
     def _init_device(self):
         if not vllm_version_is("0.23.0"):
             # vLLM v0.24.0 (PR #45026) removed automatic per-process device
@@ -538,7 +586,7 @@ class NPUWorker(WorkerBase):
         # --kv-cache-memory. Still run profile_run() to compile the model,
         # but skip the memory profiling calculation entirely.
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
-            self.model_runner.profile_run()
+            self._profile_run_with_memory_snapshot()
             logger.info(
                 "Initial free memory %.2f GiB, reserved %.2f GiB for KV Cache "
                 "as specified by kv_cache_memory_bytes, skipping memory profiling. "
@@ -558,7 +606,7 @@ class NPUWorker(WorkerBase):
             self.init_snapshot,
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
-            self.model_runner.profile_run()
+            self._profile_run_with_memory_snapshot()
 
             # Record torch peak INSIDE the context and BEFORE graph capture,
             # so that graph pool allocations don't inflate the activation peak.
