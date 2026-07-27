@@ -161,6 +161,8 @@ public:
         this->Attr("qc_qr_scale").AttrType(OPTIONAL).Float(1.0f);
         this->Attr("kc_scale").AttrType(OPTIONAL).Float(1.0f);
         this->Attr("do_rope").AttrType(OPTIONAL).Bool(true);
+        this->Attr("kv_cache_stride0").AttrType(OPTIONAL).Int(0);
+        this->Attr("kr_cache_stride0").AttrType(OPTIONAL).Int(0);
 
         OpAICoreConfig aicore_config_95;
         aicore_config_95.Input("token_x")

@@ -95,6 +95,8 @@ constexpr uint32_t QC_QR_SCALE_ATTR_INDEX = 10;
 constexpr uint32_t KC_SCALE_ATTR_INDEX = 11;
 constexpr uint32_t DO_ROPE_ATTR_INDEX_V1 = 3;
 constexpr uint32_t DO_ROPE_ATTR_INDEX_V3 = 12;
+constexpr uint32_t KV_CACHE_STRIDE0_ATTR_INDEX = 13;
+constexpr uint32_t KR_CACHE_STRIDE0_ATTR_INDEX = 14;
 
 constexpr uint32_t MLA_PROLOG_DIM_INDEX_0 = 0;
 constexpr uint32_t MLA_PROLOG_DIM_INDEX_1 = 1;
@@ -376,6 +378,9 @@ struct MlaPrologContext {
     const float *qcQrScale;
     const float *kcScale;
     const bool *doRope;
+
+    uint64_t kvCacheStride0 = 0U;
+    uint64_t krCacheStride0 = 0U;
 
     size_t *workSpaces;
     uint64_t tilingKey;
