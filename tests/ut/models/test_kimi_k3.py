@@ -10,6 +10,7 @@ import torch_npu
 from PIL import Image
 from torch import nn
 from transformers import BatchFeature
+from vllm.model_executor.models.interfaces import supports_eagle3
 from vllm.multimodal.parse import MultiModalDataItems, VisionChunkProcessorItems
 
 from vllm_ascend.models import kimi_k3, kimi_k3_text, kimi_k3_vit
@@ -503,6 +504,121 @@ def test_attention_residual_flashcomm_reanchors_dynamic_token_shape(monkeypatch:
     expected = torch.matmul(probabilities, values_fp32).squeeze(1).to(values.dtype)
     assert anchor_calls == [((5, 4), (5, 4))]
     torch.testing.assert_close(actual, expected)
+
+
+def test_text_model_captures_materialized_dspark_aux_stream(monkeypatch: pytest.MonkeyPatch):
+    residual_calls: list[tuple[int, torch.Tensor]] = []
+    consumed_inputs: list[torch.Tensor] = []
+
+    class Marker(nn.Module):
+        def __init__(self, value: int) -> None:
+            super().__init__()
+            self.value = value
+
+    class FakeLayer(nn.Module):
+        def __init__(self, layer_idx: int) -> None:
+            super().__init__()
+            self.layer_idx = layer_idx
+            self.self_attention_res_proj = Marker(layer_idx)
+            self.self_attention_res_norm = nn.Identity()
+
+        def forward(
+            self,
+            positions: torch.Tensor,
+            hidden_states: torch.Tensor,
+            block_residual: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            del positions
+            if block_residual.shape[1] > 0:
+                hidden_states = kimi_k3_text._apply_attention_residual(
+                    hidden_states,
+                    block_residual,
+                    self.self_attention_res_proj,
+                    self.self_attention_res_norm,
+                )
+            consumed_inputs.append(hidden_states.clone())
+            if block_residual.shape[1] == 0:
+                block_residual = hidden_states.unsqueeze(1)
+            return hidden_states + 10, block_residual
+
+    def fake_attention_residual(
+        hidden_states: torch.Tensor,
+        block_residual: torch.Tensor,
+        projection: Marker,
+        norm: nn.Module,
+    ) -> torch.Tensor:
+        del block_residual, norm
+        residual_calls.append((projection.value, hidden_states.clone()))
+        return hidden_states + projection.value * 100
+
+    monkeypatch.setattr(kimi_k3_text, "_apply_attention_residual", fake_attention_residual)
+    monkeypatch.setattr(
+        kimi_k3_text,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+
+    model = KimiK3TextModel.__new__(KimiK3TextModel)
+    nn.Module.__init__(model)
+    model.do_not_compile = True
+    model.start_layer = 0
+    model.end_layer = 2
+    model.layers = nn.ModuleList([FakeLayer(0), FakeLayer(1)])
+    model.embed_input_ids = MagicMock(return_value=torch.tensor([[1.0]]))
+    model.output_attn_res_proj = Marker(0)
+    model.output_attn_res_norm = nn.Identity()
+    model.norm = nn.Identity()
+    model.set_aux_hidden_state_layers((0, 1))
+
+    hidden_states, aux_hidden_states = model(
+        torch.tensor([1]),
+        torch.tensor([0]),
+        None,
+    )
+
+    torch.testing.assert_close(aux_hidden_states[0], consumed_inputs[0])
+    torch.testing.assert_close(aux_hidden_states[1], consumed_inputs[1])
+    torch.testing.assert_close(aux_hidden_states[0], torch.tensor([[1.0]]))
+    torch.testing.assert_close(aux_hidden_states[1], torch.tensor([[111.0]]))
+    torch.testing.assert_close(hidden_states, torch.tensor([[121.0]]))
+    assert [layer_idx for layer_idx, _ in residual_calls] == [1, 1, 0]
+
+
+def test_kimi_k3_dspark_aux_interface_forwards_layers():
+    model = AscendKimiK3ForCausalLM.__new__(AscendKimiK3ForCausalLM)
+    nn.Module.__init__(model)
+    model.model = MagicMock()
+
+    model.set_aux_hidden_state_layers((8, 24))
+
+    model.model.set_aux_hidden_state_layers.assert_called_once_with((8, 24))
+    assert model.supports_eagle3 is True
+    assert model.get_eagle3_default_aux_hidden_state_layers() == (8, 24, 52, 68, 84)
+
+
+def test_kimi_k3_multimodal_wrapper_forwards_dspark_aux_interface():
+    model = AscendKimiK3ForConditionalGeneration.__new__(AscendKimiK3ForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.language_model = MagicMock()
+    model.language_model.get_eagle3_default_aux_hidden_state_layers.return_value = (
+        8,
+        24,
+        52,
+        68,
+        84,
+    )
+
+    model.set_aux_hidden_state_layers((8, 24))
+
+    model.language_model.set_aux_hidden_state_layers.assert_called_once_with((8, 24))
+    assert model.get_eagle3_default_aux_hidden_state_layers() == (
+        8,
+        24,
+        52,
+        68,
+        84,
+    )
+    assert supports_eagle3(model)
 
 
 def test_routed_output_transform_is_non_owning_and_fullgraph_traceable():
