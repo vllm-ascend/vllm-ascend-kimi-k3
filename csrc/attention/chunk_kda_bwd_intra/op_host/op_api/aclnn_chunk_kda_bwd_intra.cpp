@@ -303,16 +303,20 @@ extern "C" aclnnStatus aclnnChunkKdaBwdIntraGetWorkspaceSize(
     const aclTensor *dgOutBnsd = dgOut;
 
     // Torch 2.10 can expose flattened storage descriptors to the generated
-    // custom-op tiling path even when the public tensor view is rank 4. Build
-    // explicit zero-copy internal-layout views for both TND and BNSD so tiling
-    // always observes the rank and dimensions required by the kernel contract.
-    if (parsedLayout == Layout::TND || parsedLayout == Layout::BNSD) {
-        const op::Shape vectorShape =
-            MakeShape({batch, headNum, seqlen, headDim});
-        const op::Shape scalarShape =
-            MakeShape({batch, headNum, seqlen});
-        const op::Shape matrixShape =
-            MakeShape({batch, headNum, seqlen, chunkSize});
+    // custom-op tiling path even when the public tensor view has the expected
+    // rank. Build explicit zero-copy views for layouts that enter the KDA
+    // kernel directly. Varlen keeps its [1,T,H,*] compatibility layout, while
+    // dense BNSD uses [B,H,T,*].
+    if (parsedLayout == Layout::BNSD || isVarLen) {
+        const op::Shape vectorShape = isVarLen
+            ? MakeShape({1, seqlen, headNum, headDim})
+            : MakeShape({batch, headNum, seqlen, headDim});
+        const op::Shape scalarShape = isVarLen
+            ? MakeShape({1, seqlen, headNum})
+            : MakeShape({batch, headNum, seqlen});
+        const op::Shape matrixShape = isVarLen
+            ? MakeShape({1, seqlen, headNum, chunkSize})
+            : MakeShape({batch, headNum, seqlen, chunkSize});
         qBnsd = l0op::Reshape(q, vectorShape, executorPtr);
         kBnsd = l0op::Reshape(k, vectorShape, executorPtr);
         gkBnsd = l0op::Reshape(gk, vectorShape, executorPtr);
@@ -336,9 +340,25 @@ extern "C" aclnnStatus aclnnChunkKdaBwdIntraGetWorkspaceSize(
                       dgOutBnsd != nullptr,
                   ACLNN_ERR_INNER_NULLPTR);
     } else if (!isInternalLayout) {
+        const op::Shape bsndVectorShape =
+            MakeShape({batch, seqlen, headNum, headDim});
+        const op::Shape bsndScalarShape =
+            MakeShape({batch, seqlen, headNum});
+        const op::Shape bsndMatrixShape =
+            MakeShape({batch, seqlen, headNum, chunkSize});
         const op::Shape vectorShape = MakeShape({batch, headNum, seqlen, headDim});
         const op::Shape scalarShape = MakeShape({batch, headNum, seqlen});
         const op::Shape matrixShape = MakeShape({batch, headNum, seqlen, chunkSize});
+        const aclTensor *qBsnd = l0op::Reshape(q, bsndVectorShape, executorPtr);
+        const aclTensor *kBsnd = l0op::Reshape(k, bsndVectorShape, executorPtr);
+        const aclTensor *gkBsnd = l0op::Reshape(gk, bsndVectorShape, executorPtr);
+        const aclTensor *betaBsn = l0op::Reshape(beta, bsndScalarShape, executorPtr);
+        const aclTensor *dAqkBsnt = l0op::Reshape(dAqk, bsndMatrixShape, executorPtr);
+        const aclTensor *dAkkBsnt = l0op::Reshape(dAkk, bsndMatrixShape, executorPtr);
+        const aclTensor *dqBsnd = l0op::Reshape(dq, bsndVectorShape, executorPtr);
+        const aclTensor *dkBsnd = l0op::Reshape(dk, bsndVectorShape, executorPtr);
+        const aclTensor *dbBsn = l0op::Reshape(db, bsndScalarShape, executorPtr);
+        const aclTensor *dgBsnd = l0op::Reshape(dg, bsndVectorShape, executorPtr);
         qBnsd = executorPtr->AllocTensor(vectorShape, q->GetDataType(), Format::FORMAT_ND);
         kBnsd = executorPtr->AllocTensor(vectorShape, k->GetDataType(), Format::FORMAT_ND);
         gkBnsd = executorPtr->AllocTensor(vectorShape, gk->GetDataType(), Format::FORMAT_ND);
@@ -353,32 +373,37 @@ extern "C" aclnnStatus aclnnChunkKdaBwdIntraGetWorkspaceSize(
         dkOutBnsd = executorPtr->AllocTensor(vectorShape, dkOut->GetDataType(), Format::FORMAT_ND);
         dbOutBns = executorPtr->AllocTensor(scalarShape, dbOut->GetDataType(), Format::FORMAT_ND);
         dgOutBnsd = executorPtr->AllocTensor(vectorShape, dgOut->GetDataType(), Format::FORMAT_ND);
-        CHECK_RET(qBnsd != nullptr && kBnsd != nullptr && gkBnsd != nullptr &&
+        CHECK_RET(qBsnd != nullptr && kBsnd != nullptr && gkBsnd != nullptr &&
+                      betaBsn != nullptr && dAqkBsnt != nullptr &&
+                      dAkkBsnt != nullptr && dqBsnd != nullptr &&
+                      dkBsnd != nullptr && dbBsn != nullptr &&
+                      dgBsnd != nullptr && qBnsd != nullptr &&
+                      kBnsd != nullptr && gkBnsd != nullptr &&
                       betaBns != nullptr && dAqkBnst != nullptr && dAkkBnst != nullptr &&
                       dqBnsd != nullptr && dkBnsd != nullptr && dbBns != nullptr &&
                       dgBnsd != nullptr && dqOutBnsd != nullptr && dkOutBnsd != nullptr &&
                       dbOutBns != nullptr && dgOutBnsd != nullptr,
                   ACLNN_ERR_INNER_NULLPTR);
 
-        CHECK_RET(l0op::KdaLayoutSwap12(q, qBnsd, executorPtr)[0] != nullptr,
+        CHECK_RET(l0op::KdaLayoutSwap12(qBsnd, qBnsd, executorPtr)[0] != nullptr,
                   ACLNN_ERR_INNER_NULLPTR);
-        CHECK_RET(l0op::KdaLayoutSwap12(k, kBnsd, executorPtr)[0] != nullptr,
+        CHECK_RET(l0op::KdaLayoutSwap12(kBsnd, kBnsd, executorPtr)[0] != nullptr,
                   ACLNN_ERR_INNER_NULLPTR);
-        CHECK_RET(l0op::KdaLayoutSwap12(gk, gkBnsd, executorPtr)[0] != nullptr,
+        CHECK_RET(l0op::KdaLayoutSwap12(gkBsnd, gkBnsd, executorPtr)[0] != nullptr,
                   ACLNN_ERR_INNER_NULLPTR);
-        CHECK_RET(l0op::KdaLayoutSwap12(beta, betaBns, executorPtr)[0] != nullptr,
+        CHECK_RET(l0op::KdaLayoutSwap12(betaBsn, betaBns, executorPtr)[0] != nullptr,
                   ACLNN_ERR_INNER_NULLPTR);
-        CHECK_RET(l0op::KdaLayoutSwap12(dAqk, dAqkBnst, executorPtr)[0] != nullptr,
+        CHECK_RET(l0op::KdaLayoutSwap12(dAqkBsnt, dAqkBnst, executorPtr)[0] != nullptr,
                   ACLNN_ERR_INNER_NULLPTR);
-        CHECK_RET(l0op::KdaLayoutSwap12(dAkk, dAkkBnst, executorPtr)[0] != nullptr,
+        CHECK_RET(l0op::KdaLayoutSwap12(dAkkBsnt, dAkkBnst, executorPtr)[0] != nullptr,
                   ACLNN_ERR_INNER_NULLPTR);
-        CHECK_RET(l0op::KdaLayoutSwap12(dq, dqBnsd, executorPtr)[0] != nullptr,
+        CHECK_RET(l0op::KdaLayoutSwap12(dqBsnd, dqBnsd, executorPtr)[0] != nullptr,
                   ACLNN_ERR_INNER_NULLPTR);
-        CHECK_RET(l0op::KdaLayoutSwap12(dk, dkBnsd, executorPtr)[0] != nullptr,
+        CHECK_RET(l0op::KdaLayoutSwap12(dkBsnd, dkBnsd, executorPtr)[0] != nullptr,
                   ACLNN_ERR_INNER_NULLPTR);
-        CHECK_RET(l0op::KdaLayoutSwap12(db, dbBns, executorPtr)[0] != nullptr,
+        CHECK_RET(l0op::KdaLayoutSwap12(dbBsn, dbBns, executorPtr)[0] != nullptr,
                   ACLNN_ERR_INNER_NULLPTR);
-        CHECK_RET(l0op::KdaLayoutSwap12(dg, dgBnsd, executorPtr)[0] != nullptr,
+        CHECK_RET(l0op::KdaLayoutSwap12(dgBsnd, dgBnsd, executorPtr)[0] != nullptr,
                   ACLNN_ERR_INNER_NULLPTR);
     }
 
