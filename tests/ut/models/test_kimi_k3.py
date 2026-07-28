@@ -24,6 +24,7 @@ from vllm_ascend.models.kimi_k3_text import (
     KimiK3MLAAttention,
     KimiK3MoE,
     KimiK3TextModel,
+    _get_kimi_k3_num_loaded_layers,
     _apply_attention_residual,
     _routed_latent_quant_config,
 )
@@ -116,6 +117,61 @@ def test_kimi_k3_model_cache_shape_includes_speculative_tokens(monkeypatch):
     actual = AscendKimiK3ForCausalLM.get_mamba_state_shape_from_config(vllm_config)
 
     assert actual == ((6, 48), (2, 8, 8))
+
+
+@pytest.mark.parametrize(
+    ("env_value", "expected"),
+    [
+        ("0", 4),
+        ("3", 3),
+    ],
+)
+def test_kimi_k3_layer_reduction_config(monkeypatch, env_value, expected):
+    monkeypatch.setenv("VLLM_ASCEND_KIMI_K3_MAX_LOADED_LAYERS", env_value)
+
+    assert _get_kimi_k3_num_loaded_layers(4) == expected
+
+
+@pytest.mark.parametrize("env_value", ["-1", "5", "True", "3.0"])
+def test_kimi_k3_layer_reduction_config_rejects_invalid_values(monkeypatch, env_value):
+    monkeypatch.setenv("VLLM_ASCEND_KIMI_K3_MAX_LOADED_LAYERS", env_value)
+
+    with pytest.raises(ValueError, match="VLLM_ASCEND_KIMI_K3_MAX_LOADED_LAYERS"):
+        _get_kimi_k3_num_loaded_layers(4)
+
+
+def test_kimi_k3_text_model_instantiates_only_requested_decoder_layers(monkeypatch):
+    class StubModule(nn.Module):
+        pass
+
+    captured = {}
+
+    def fake_make_layers(num_hidden_layers, layer_fn, prefix):
+        del layer_fn, prefix
+        captured["num_hidden_layers"] = num_hidden_layers
+        return 0, num_hidden_layers, nn.ModuleList([StubModule() for _ in range(num_hidden_layers)])
+
+    monkeypatch.setattr(
+        kimi_k3_text,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(kimi_k3_text, "VocabParallelEmbedding", lambda *args, **kwargs: StubModule())
+    monkeypatch.setattr(kimi_k3_text, "RMSNorm", lambda *args, **kwargs: StubModule())
+    monkeypatch.setattr(kimi_k3_text, "ReplicatedLinear", lambda *args, **kwargs: StubModule())
+    monkeypatch.setattr(kimi_k3_text, "make_layers", fake_make_layers)
+    monkeypatch.setenv("VLLM_ASCEND_KIMI_K3_MAX_LOADED_LAYERS", "2")
+
+    config = _tiny_k3_config().text_config
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_text_config=config),
+    )
+
+    model = KimiK3TextModel(vllm_config=vllm_config, prefix="model")
+
+    assert model.num_loaded_layers == 2
+    assert captured["num_hidden_layers"] == 2
+    assert len(model.layers) == 2
 
 
 def test_kimi_k3_vision_config_exposes_vllm_aliases():
@@ -362,6 +418,7 @@ def test_kimi_k3_text_loader_maps_real_checkpoint_names_to_shards():
         num_hidden_layers=5,
         num_nextn_predict_layers=0,
     )
+    model.num_loaded_layers = 4
     model.named_parameters = lambda: iter(params.items())
     weights = [
         ("model.layers.0.mlp.gate_proj.weight", torch.tensor([10.0])),
@@ -384,6 +441,10 @@ def test_kimi_k3_text_loader_maps_real_checkpoint_names_to_shards():
             torch.tensor([32.0]),
         ),
         ("model.layers.0.self_attn.g_proj.weight", torch.tensor([40.0])),
+        (
+            "layers.68.block_sparse_moe.experts.w13_scale_bias",
+            torch.tensor([50.0]),
+        ),
     ]
 
     loaded = model.load_weights(iter(weights))

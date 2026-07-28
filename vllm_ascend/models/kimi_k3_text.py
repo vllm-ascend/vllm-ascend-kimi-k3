@@ -13,6 +13,7 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
+from vllm.logger import logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import FusedMoE, fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -44,11 +45,60 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 
+from vllm_ascend import envs as envs_ascend
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.activation import AscendSituAndMul
 from vllm_ascend.ops.kimi_kda_state import kimi_kda_state_shape
 from vllm_ascend.transformers_utils.configs.kimi_k3 import KimiK3TextConfig
 from vllm_ascend.utils import uses_global_inputs_embeds
+
+
+KIMI_K3_MAX_LOADED_LAYERS_ENV = "VLLM_ASCEND_KIMI_K3_MAX_LOADED_LAYERS"
+
+
+def _get_kimi_k3_num_loaded_layers(
+    total_num_layers: int,
+) -> int:
+    """Return the requested K3 decoder-layer count for debug loading.
+
+    A value of ``0`` (the default) preserves the complete model. The setting
+    intentionally lives outside the checkpoint configuration, so it is only a
+    process-local debug aid.
+    """
+    requested_num_layers_raw = getattr(envs_ascend, KIMI_K3_MAX_LOADED_LAYERS_ENV)
+    try:
+        requested_num_layers = int(requested_num_layers_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{KIMI_K3_MAX_LOADED_LAYERS_ENV} must be an integer in "
+            f"[0, {total_num_layers}], got {requested_num_layers_raw!r}"
+        ) from exc
+    if requested_num_layers == 0:
+        return total_num_layers
+    if not 1 <= requested_num_layers <= total_num_layers:
+        raise ValueError(
+            f"{KIMI_K3_MAX_LOADED_LAYERS_ENV} must be in "
+            f"[0, {total_num_layers}], got {requested_num_layers}"
+        )
+    return requested_num_layers
+
+
+def _get_decoder_layer_idx_from_weight_name(weight_name: str) -> int | None:
+    """Extract a K3 decoder-layer index from an inner or VL checkpoint key."""
+    # AutoWeightsLoader removes the child-module prefix before delegating to
+    # KimiK3TextModel.load_weights, so the same tensor can arrive as either
+    # ``model.layers.<idx>`` or ``layers.<idx>``.
+    layer_prefix = "layers."
+    prefix_idx = weight_name.find(layer_prefix)
+    if prefix_idx < 0:
+        return None
+
+    layer_idx_start = prefix_idx + len(layer_prefix)
+    layer_idx_end = weight_name.find(".", layer_idx_start)
+    if layer_idx_end < 0:
+        return None
+    layer_idx_text = weight_name[layer_idx_start:layer_idx_end]
+    return int(layer_idx_text) if layer_idx_text.isdecimal() else None
 
 
 def _situ_params(config: KimiK3TextConfig) -> tuple[float, float | None]:
@@ -512,6 +562,15 @@ class KimiK3TextModel(nn.Module):
         config: KimiK3TextConfig = vllm_config.model_config.hf_text_config
         self.config = config
         self.vocab_size = config.vocab_size
+        self.num_loaded_layers = _get_kimi_k3_num_loaded_layers(config.num_hidden_layers)
+        if self.num_loaded_layers != config.num_hidden_layers:
+            logger.warning_once(
+                "Kimi K3 layer-reduced debug mode is enabled: loading and "
+                "executing decoder layers [0, %d) out of %d. Generated "
+                "results are not model-quality valid.",
+                self.num_loaded_layers,
+                config.num_hidden_layers,
+            )
 
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -526,7 +585,7 @@ class KimiK3TextModel(nn.Module):
             return KimiK3DecoderLayer(config, vllm_config, prefix)
 
         self.start_layer, self.end_layer, self.layers = make_layers(
-            config.num_hidden_layers,
+            self.num_loaded_layers,
             get_layer,
             prefix=f"{prefix}.layers",
         )
@@ -610,6 +669,9 @@ class KimiK3TextModel(nn.Module):
             name, loaded_weight = args[:2]
             loader_kwargs: dict[str, Any] = args[2] if len(args) == 3 else {}
             if "rotary_emb" in name:
+                continue
+            layer_idx = _get_decoder_layer_idx_from_weight_name(name)
+            if layer_idx is not None and layer_idx >= self.num_loaded_layers:
                 continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
