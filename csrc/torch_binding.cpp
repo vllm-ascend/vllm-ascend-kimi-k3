@@ -2433,6 +2433,124 @@ chunk_kda_fwd(
     return std::make_tuple(o, final_state, g, aqk, akk, w, u, qg, kg, v_new, h, initial_state_out);
 }
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+chunk_kda_bwd_intra(
+    const at::Tensor &q,
+    const at::Tensor &k,
+    const at::Tensor &gk,
+    const at::Tensor &beta,
+    const at::Tensor &dAqk,
+    const at::Tensor &dAkk,
+    const at::Tensor &dq,
+    const at::Tensor &dk,
+    const at::Tensor &db,
+    const at::Tensor &dg,
+    c10::optional<at::IntArrayRef> cu_seqlens,
+    c10::optional<at::IntArrayRef> chunk_indices,
+    int64_t chunk_size,
+    bool safe_gate,
+    c10::string_view layout)
+{
+    constexpr const char *op_name = "chunk_kda_bwd_intra";
+    std::string layout_str(layout.data(), layout.size());
+    TORCH_CHECK(layout_str == "BSND" || layout_str == "BNSD" || layout_str == "TND",
+                op_name, ": layout must be one of BSND, BNSD or TND.");
+    TORCH_CHECK(safe_gate, op_name, ": safe_gate=False is reserved but not supported in v1.");
+    TORCH_CHECK(chunk_size == 64, op_name, ": chunk_size must be 64.");
+
+    auto check_tensor = [&](const at::Tensor &tensor, const char *name, at::ScalarType dtype) {
+        TORCH_CHECK(tensor.scalar_type() == dtype, op_name, ": ", name, " has an unsupported dtype.");
+        TORCH_CHECK(tensor.device() == q.device(), op_name, ": ", name, " must be on the same device as q.");
+        TORCH_CHECK(tensor.is_contiguous(), op_name, ": ", name, " must be contiguous.");
+    };
+    check_tensor(q, "q", at::kBFloat16);
+    check_tensor(k, "k", at::kBFloat16);
+    check_tensor(gk, "gk", at::kFloat);
+    check_tensor(beta, "beta", at::kBFloat16);
+    check_tensor(dAqk, "dAqk", at::kFloat);
+    check_tensor(dAkk, "dAkk", at::kFloat);
+    check_tensor(dq, "dq", at::kFloat);
+    check_tensor(dk, "dk", at::kFloat);
+    check_tensor(db, "db", at::kFloat);
+    check_tensor(dg, "dg", at::kFloat);
+
+    const bool is_tnd = layout_str == "TND";
+    const bool is_bsnd = layout_str == "BSND";
+    const bool is_varlen = cu_seqlens.has_value();
+    TORCH_CHECK(is_varlen || !is_tnd,
+                op_name, ": TND layout requires cu_seqlens.");
+    TORCH_CHECK(!is_varlen || layout_str != "BNSD",
+                op_name, ": varlen supports TND or BSND storage, not BNSD.");
+    TORCH_CHECK((is_tnd && q.dim() == 3) || (!is_tnd && q.dim() == 4),
+                op_name, ": q rank does not match layout.");
+    TORCH_CHECK(q.sizes() == k.sizes() && q.sizes() == gk.sizes() &&
+                    q.sizes() == dq.sizes() && q.sizes() == dk.sizes() &&
+                    q.sizes() == dg.sizes(),
+                op_name, ": q/k/gk/dq/dk/dg must have identical shapes.");
+
+    const int64_t batch = is_tnd ? 1 : q.size(0);
+    const int64_t seqlen = is_tnd ? q.size(0) : q.size(is_bsnd ? 1 : 2);
+    const int64_t heads = is_tnd ? q.size(1) : q.size(is_bsnd ? 2 : 1);
+    const int64_t head_dim = is_tnd ? q.size(2) : q.size(3);
+    TORCH_CHECK(batch > 0 && seqlen > 0 && heads > 0,
+                op_name, ": B/H/T must be positive.");
+    TORCH_CHECK((is_varlen && head_dim == 128) ||
+                    (!is_varlen && (head_dim == 64 || head_dim == 128 || head_dim == 256)),
+                op_name, ": varlen supports K=128; dense supports K=64, 128 or 256.");
+    TORCH_CHECK(!is_varlen || !is_bsnd || batch == 1,
+                op_name, ": varlen BSND compatibility requires B=1.");
+
+    const bool scalar_shape_matches = is_tnd
+        ? beta.dim() == 2 && beta.size(0) == seqlen && beta.size(1) == heads
+        : beta.dim() == 3 && beta.size(0) == batch &&
+            beta.size(is_bsnd ? 1 : 2) == seqlen &&
+            beta.size(is_bsnd ? 2 : 1) == heads;
+    TORCH_CHECK(scalar_shape_matches && beta.sizes() == db.sizes(),
+                op_name, ": beta/db shape must match the selected layout.");
+
+    const bool matrix_shape_matches = is_tnd
+        ? dAqk.dim() == 3 && dAqk.size(0) == seqlen &&
+            dAqk.size(1) == heads && dAqk.size(2) == chunk_size
+        : dAqk.dim() == 4 && dAqk.size(0) == batch &&
+            dAqk.size(is_bsnd ? 1 : 2) == seqlen &&
+            dAqk.size(is_bsnd ? 2 : 1) == heads &&
+            dAqk.size(3) == chunk_size;
+    TORCH_CHECK(matrix_shape_matches && dAqk.sizes() == dAkk.sizes(),
+                op_name, ": dAqk/dAkk shape must match the selected layout.");
+
+    check_kda_cu_seqlens(cu_seqlens, seqlen, op_name);
+    check_kda_chunk_indices(chunk_indices, cu_seqlens, chunk_size, op_name);
+    if (is_varlen) {
+        auto cu = cu_seqlens.value();
+        TORCH_CHECK(cu.size() <= 65, op_name, ": cu_seqlens must contain at most 65 entries.");
+        TORCH_CHECK(get_kda_total_chunks(batch, seqlen, chunk_size, cu_seqlens, chunk_indices) > 0,
+                    op_name, ": varlen input must contain at least one non-empty sequence.");
+        if (chunk_indices.has_value()) {
+            auto indices = chunk_indices.value();
+            auto canonical = build_kda_chunk_indices(cu, chunk_size);
+            TORCH_CHECK(indices.size() == canonical.size(),
+                        op_name, ": chunk_indices must contain exactly one pair per chunk.");
+            for (size_t i = 0; i < canonical.size(); ++i) {
+                TORCH_CHECK(indices[i] == canonical[i],
+                            op_name, ": chunk_indices must use canonical sequence-major order.");
+            }
+        }
+    }
+
+    at::Tensor dq_out = at::empty_like(dq);
+    at::Tensor dk_out = at::empty_like(dk);
+    at::Tensor db_out = at::empty_like(db);
+    at::Tensor dg_out = at::empty_like(dg);
+    char *layout_cstr = const_cast<char *>(layout_str.c_str());
+    EXEC_NPU_CMD(
+        aclnnChunkKdaBwdIntra,
+        q, k, gk, beta, dAqk, dAkk, dq, dk, db, dg,
+        cu_seqlens, chunk_indices, chunk_size, safe_gate, layout_cstr,
+        dq_out, dk_out, db_out, dg_out
+    );
+    return std::make_tuple(dq_out, dk_out, db_out, dg_out);
+}
+
 at::Tensor kda_gate_cumsum(
     const at::Tensor &g,
     int64_t chunk_size,
@@ -3308,6 +3426,11 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "chunk_kda_fwd(Tensor q, Tensor k, Tensor v, Tensor gk, Tensor beta, float scale, int chunk_size, str layout=\"BSND\", *, Tensor? initial_state=None, bool? output_final_state=False, int[]? cu_seqlens=None, int[]? chunk_indices=None, bool? return_intermediate=False, bool? safe_gate=False, bool? transpose_state_layout=False) -> (Tensor o, Tensor final_state, Tensor g, Tensor aqk, Tensor akk, Tensor w, Tensor u, Tensor qg, Tensor kg, Tensor v_new, Tensor h, Tensor initial_state_out)"
     );
     ops.impl("chunk_kda_fwd", torch::kPrivateUse1, &vllm_ascend::chunk_kda_fwd);
+
+    ops.def(
+        "chunk_kda_bwd_intra(Tensor q, Tensor k, Tensor gk, Tensor beta, Tensor dAqk, Tensor dAkk, Tensor dq, Tensor dk, Tensor db, Tensor dg, *, int[]? cu_seqlens=None, int[]? chunk_indices=None, int chunk_size=64, bool safe_gate=True, str layout=\"BSND\") -> (Tensor dq_out, Tensor dk_out, Tensor db_out, Tensor dg_out)"
+    );
+    ops.impl("chunk_kda_bwd_intra", torch::kPrivateUse1, &vllm_ascend::chunk_kda_bwd_intra);
 
     ops.def(
         "kda_gate_cumsum(Tensor g, int chunk_size, *, Tensor? A_log=None, Tensor? dt_bias=None, int[]? cu_seqlens=None, bool? use_gate_in_kernel=False, bool? safe_gate=False, float? lower_bound=-5.0, str layout=\"BSND\") -> Tensor"
