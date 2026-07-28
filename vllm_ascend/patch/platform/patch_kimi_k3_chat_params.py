@@ -29,7 +29,6 @@ from typing import Any
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
 from vllm.entrypoints.serve.render.serving import OpenAIServingRender
-from vllm.exceptions import VLLMValidationError
 
 from vllm_ascend.patch.platform.patch_kimi_k3_renderer import (
     KIMI_K3_PROMPT_TOOL_CHOICE_KEY,
@@ -42,15 +41,6 @@ _ORIGINAL_RENDER_CHAT_ATTR = "_ascend_original_kimi_k3_render_chat"
 _ORIGINAL_EFFECTIVE_KWARGS_ATTR = "_ascend_original_kimi_k3_effective_chat_template_kwargs"
 _PREPARED_ATTR = "_kimi_k3_chat_params_prepared"
 
-_REASONING_EFFORT_MAP = {
-    "minimal": "low",
-    "low": "low",
-    "medium": "high",
-    "high": "high",
-    "xhigh": "max",
-    "max": "max",
-}
-
 
 def _model_dump(value: Any) -> Any:
     if hasattr(value, "model_dump"):
@@ -58,75 +48,27 @@ def _model_dump(value: Any) -> Any:
     return value
 
 
-def _tool_name(tool: Any) -> str | None:
-    if isinstance(tool, dict):
-        function = tool.get("function")
-        if isinstance(function, dict):
-            return function.get("name")
-        return getattr(function, "name", None)
-    return getattr(getattr(tool, "function", None), "name", None)
-
-
-def _named_tool_choice(request: ChatCompletionRequest) -> str | None:
-    choice = request.tool_choice
-    function = choice.get("function") if isinstance(choice, dict) else getattr(choice, "function", None)
-    if isinstance(function, dict):
-        return function.get("name")
-    return getattr(function, "name", None)
-
-
 def prepare_kimi_k3_chat_template_kwargs(request: ChatCompletionRequest) -> None:
-    """Merge OpenAI controls with K3-native tokenizer kwargs.
-
-    Preserve explicitly supplied native kwargs and only derive values from
-    typed OpenAI fields when their native counterpart is absent.
-    """
+    """Pass typed OpenAI controls missing from vLLM 0.23 chat params."""
 
     if getattr(request, _PREPARED_ATTR, False):
         return
 
-    user_kwargs = request.chat_template_kwargs or {}
-    template_kwargs = dict(user_kwargs)
+    template_kwargs = dict(request.chat_template_kwargs or {})
     request_tools = [_model_dump(tool) for tool in (request.tools or [])]
 
-    if "thinking" not in user_kwargs and request.reasoning_effort is not None:
-        template_kwargs["thinking"] = request.reasoning_effort != "none"
-    if (
-        "thinking_effort" not in user_kwargs
-        and template_kwargs.get("thinking", True)
-        and request.reasoning_effort in _REASONING_EFFORT_MAP
-    ):
-        template_kwargs["thinking_effort"] = _REASONING_EFFORT_MAP.get(
-            request.reasoning_effort,
-            "max",
-        )
+    template_kwargs["tools"] = request_tools
+    tool_choice = _model_dump(request.tool_choice)
+    if tool_choice is None:
+        tool_choice = "auto" if request_tools else "none"
+        if tool_choice == "auto":
+            request.tool_choice = "auto"
+    template_kwargs["tool_choice"] = tool_choice
 
-    if "tools" not in user_kwargs:
-        template_kwargs["tools"] = request_tools
+    if isinstance(tool_choice, str) and tool_choice in {"none", "auto", "required"}:
+        template_kwargs[KIMI_K3_PROMPT_TOOL_CHOICE_KEY] = encode_kimi_k3_prompt_tool_choice(tool_choice)
 
-    if "tool_choice" not in user_kwargs:
-        named_tool = _named_tool_choice(request)
-        if named_tool:
-            matching_tools = [tool for tool in request_tools if _tool_name(tool) == named_tool]
-            if not matching_tools:
-                raise VLLMValidationError(
-                    f"Named Kimi K3 tool choice {named_tool!r} is not declared.",
-                    parameter="tool_choice",
-                )
-            template_kwargs["tool_choice"] = "required"
-            template_kwargs["tools"] = matching_tools
-        elif isinstance(request.tool_choice, str):
-            template_kwargs["tool_choice"] = request.tool_choice
-        elif request.tool_choice is None:
-            template_kwargs["tool_choice"] = "auto" if template_kwargs.get("tools") else "none"
-            if template_kwargs["tool_choice"] == "auto":
-                request.tool_choice = "auto"
-
-    prompt_tool_choice = template_kwargs.get("tool_choice")
-    if isinstance(prompt_tool_choice, str) and prompt_tool_choice in {"none", "auto", "required"}:
-        template_kwargs[KIMI_K3_PROMPT_TOOL_CHOICE_KEY] = encode_kimi_k3_prompt_tool_choice(prompt_tool_choice)
-
-    if "response_format" not in user_kwargs and request.response_format is not None:
+    if request.response_format is not None:
         template_kwargs["response_format"] = _model_dump(request.response_format)
 
     request.chat_template_kwargs = template_kwargs

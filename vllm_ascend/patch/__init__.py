@@ -203,13 +203,12 @@
 #
 # ** 7c. Files: platform/patch_kimi_k3_renderer.py,
 #               platform/patch_kimi_k3_chat_params.py,
-#               platform/patch_kimi_k3_parsers.py,
-#               platform/kimi_k3_xtml.py**
+#               platform/patch_kimi_k3_reasoning_parser.py,
+#               platform/patch_kimi_k3_tool_parser.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.renderers.registry`,
 #      `vllm.entrypoints.serve.render.serving.OpenAIServingRender`,
 #      `vllm.entrypoints.openai.chat_completion.serving.OpenAIServingChat`,
-#      `vllm.parser.ParserManager`,
 #      `vllm.reasoning.ReasoningParserManager`,
 #      `vllm.tool_parsers.ToolParserManager`,
 #    Why:
@@ -222,15 +221,11 @@
 #       retaining HF tokenizer loading, call
 #       `TikTokenTokenizer.apply_chat_template(tokenize=True)` directly with
 #       server-owned multimodal prompts, and map typed request controls only on
-#       K3 serving instances. A K3-local unified state machine parses reasoning,
-#       response, and tools for both full and streaming output while preserving
-#       the original `tool_choice`. Required and named calls stay on the XTML
-#       path rather than generic JSON grammar and fail explicitly if no valid
-#       call is produced.
+#       K3 serving instances. Backport the upstream K3 reasoning and tool
+#       parsers, plus the XTML structural tag needed by vLLM 0.23 for required
+#       and named tool choices.
 #    Related PR (if no, explain why):
-#       No. This is a compatibility implementation for the K3 model source
-#       protocol; it should be proposed to vLLM after the public model/parser
-#       integration contract stabilizes.
+#       https://github.com/vllm-project/vllm/pull/50000
 #    Future Plan:
 #       Remove these patches once the supported vLLM version provides native
 #       Kimi K3 rendering and parser registration.

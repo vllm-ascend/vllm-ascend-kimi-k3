@@ -20,8 +20,7 @@ Kimi K3 deliberately does not publish a Jinja chat template. Its trusted
 remote ``TikTokenTokenizer.apply_chat_template`` implements the XTML protocol,
 including typed tool calls, reasoning controls, and multimodal placeholders.
 The regular HF renderer rejects tokenizers without a Jinja template, so K3
-uses a dedicated renderer while continuing to load the tokenizer through the
-standard HF ``auto`` tokenizer mode.
+uses a dedicated ``kimi_k3`` mode backed by the standard HF tokenizer loader.
 """
 
 from __future__ import annotations
@@ -36,12 +35,15 @@ from vllm.entrypoints.chat_utils import (
     parse_chat_messages,
     parse_chat_messages_async,
 )
+from vllm.exceptions import VLLMValidationError
+from vllm.multimodal.media.connector import merge_media_io_kwargs
 from vllm.renderers import registry as renderer_registry
 from vllm.renderers.base import BaseRenderer
 from vllm.renderers.inputs import DictPrompt
 from vllm.renderers.inputs.preprocess import parse_dec_only_prompt
 from vllm.renderers.params import ChatParams
 from vllm.tokenizers.hf import HfTokenizer
+from vllm.tokenizers.registry import TokenizerRegistry
 from vllm.utils.async_utils import make_async
 
 KIMI_K3_MODEL_TYPE = "kimi_k3"
@@ -50,7 +52,15 @@ KIMI_K3_IMAGE_PROMPT = "<|media_begin|>image<|media_content|><|media_pad|><|medi
 KIMI_K3_PROMPT_TOOL_CHOICE_KEY = "_kimi_k3_prompt_tool_choice"
 _KIMI_K3_PROMPT_TOOL_CHOICE_PREFIX = "kimi_k3:"
 _KIMI_K3_PROMPT_TOOL_CHOICES = frozenset({"none", "auto", "required"})
+_K3_THINKING_EFFORTS = frozenset({"low", "high", "max"})
 _ORIGINAL_TOKENIZER_ARGS_ATTR = "_ascend_original_kimi_k3_tokenizer_args_from_config"
+_K3_MEDIA_IO_DEFAULTS: dict[str, dict[str, Any]] = {"image": {"image_mode": None}}
+
+
+def _merge_k3_media_io_kwargs(
+    media_io_kwargs: dict[str, dict[str, Any]] | None,
+) -> dict[str, dict[str, Any]] | None:
+    return merge_media_io_kwargs(_K3_MEDIA_IO_DEFAULTS, media_io_kwargs)
 
 
 def encode_kimi_k3_prompt_tool_choice(tool_choice: str) -> str:
@@ -76,14 +86,13 @@ def is_kimi_k3_model_config(model_config: ModelConfig) -> bool:
 def _normalize_developer_messages(
     conversation: list[ConversationMessage],
 ) -> list[ConversationMessage]:
-    """Convert developer roles without reordering or flattening their content."""
+    """Convert developer roles without reordering their content or tools."""
 
     converted: list[ConversationMessage] = []
     for message in conversation:
         if message["role"] == "developer":
             converted_message = dict(message)
             converted_message["role"] = "system"
-            converted_message.pop("tools", None)
             converted.append(converted_message)  # type: ignore[arg-type]
         else:
             converted.append(message)
@@ -131,16 +140,32 @@ class KimiK3Renderer(BaseRenderer[HfTokenizer]):
         # K3's Python encoder is the source of truth. In particular, do not let
         # an optional server/request Jinja value replace or filter its kwargs.
         prompt_tool_choice = kwargs.pop(KIMI_K3_PROMPT_TOOL_CHOICE_KEY, None)
+        if (enable_thinking := kwargs.pop("enable_thinking", None)) is not None:
+            kwargs.setdefault("thinking", enable_thinking)
+        if (reasoning_effort := kwargs.pop("reasoning_effort", None)) is not None:
+            kwargs.setdefault("thinking_effort", reasoning_effort)
+        thinking = kwargs.get("thinking", True)
+        if not isinstance(thinking, bool):
+            raise VLLMValidationError(
+                "Kimi K3 thinking must be a boolean.",
+                parameter="chat_template_kwargs.thinking",
+                value=thinking,
+            )
+        thinking_effort = kwargs.get("thinking_effort")
+        if thinking and thinking_effort is not None and thinking_effort not in _K3_THINKING_EFFORTS:
+            raise VLLMValidationError(
+                "Kimi K3 reasoning_effort supports low, high, and max.",
+                parameter="reasoning_effort",
+                value=thinking_effort,
+            )
         for protected_key in (
             "add_generation_prompt",
             "chat_template",
             "continue_final_message",
             "conversation",
-            "enable_thinking",
             "image_prompts",
             "max_length",
             "padding",
-            "reasoning_effort",
             "return_dict",
             "return_tensors",
             "tokenize",
@@ -153,6 +178,8 @@ class KimiK3Renderer(BaseRenderer[HfTokenizer]):
             # that merge so a server default cannot turn an auto request into
             # a required/none prompt.
             kwargs["tool_choice"] = decode_kimi_k3_prompt_tool_choice(prompt_tool_choice)
+        if kwargs.get("tool_choice") == "none" and not kwargs.get("tools"):
+            kwargs.pop("tool_choice")
         prompt = self.get_tokenizer().apply_chat_template(
             conversation=conversation_data,
             tokenize=True,
@@ -196,7 +223,7 @@ class KimiK3Renderer(BaseRenderer[HfTokenizer]):
             messages,
             self.model_config,
             content_format="openai",
-            media_io_kwargs=params.media_io_kwargs,
+            media_io_kwargs=_merge_k3_media_io_kwargs(params.media_io_kwargs),
             mm_processor_kwargs=params.mm_processor_kwargs,
         )
         return self._render_conversation(
@@ -215,7 +242,7 @@ class KimiK3Renderer(BaseRenderer[HfTokenizer]):
             messages,
             self.model_config,
             content_format="openai",
-            media_io_kwargs=params.media_io_kwargs,
+            media_io_kwargs=_merge_k3_media_io_kwargs(params.media_io_kwargs),
             mm_processor_kwargs=params.mm_processor_kwargs,
         )
         conversation = _normalize_developer_messages(conversation)
@@ -256,6 +283,13 @@ def _tokenizer_args_with_kimi_k3_renderer(model_config: ModelConfig, **kwargs):
 
 
 renderer_registry.tokenizer_args_from_config = _tokenizer_args_with_kimi_k3_renderer
+
+if KIMI_K3_RENDERER_MODE not in TokenizerRegistry.tokenizers:
+    TokenizerRegistry.register(
+        KIMI_K3_RENDERER_MODE,
+        "vllm.tokenizers.hf",
+        "CachedHfTokenizer",
+    )
 
 if KIMI_K3_RENDERER_MODE not in renderer_registry.RENDERER_REGISTRY.renderers:
     renderer_registry.RENDERER_REGISTRY.register(
