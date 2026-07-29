@@ -95,9 +95,6 @@ constexpr uint32_t QC_QR_SCALE_ATTR_INDEX = 10;
 constexpr uint32_t KC_SCALE_ATTR_INDEX = 11;
 constexpr uint32_t DO_ROPE_ATTR_INDEX_V1 = 3;
 constexpr uint32_t DO_ROPE_ATTR_INDEX_V3 = 12;
-constexpr uint32_t KV_CACHE_STRIDE0_ATTR_INDEX = 13;
-constexpr uint32_t KR_CACHE_STRIDE0_ATTR_INDEX = 14;
-
 constexpr uint32_t MLA_PROLOG_DIM_INDEX_0 = 0;
 constexpr uint32_t MLA_PROLOG_DIM_INDEX_1 = 1;
 constexpr uint32_t MLA_PROLOG_DIM_INDEX_2 = 2;
