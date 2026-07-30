@@ -67,10 +67,7 @@ inline ge::graphStatus GetCacheStride0(gert::TilingContext &context, uint32_t in
                                        const char *tensorName, uint64_t &stride0)
 {
     const uint64_t defaultStride0 = GetDefaultStride0(shape);
-    auto *stride = context.GetRequiredInputStride(inputIndex);
-    if (stride == nullptr) {
-        stride = context.GetInputStride(inputIndex);
-    }
+    auto *stride = context.GetInputStride(inputIndex);
     if (stride == nullptr || stride->GetDimNum() != shape.GetDimNum()) {
         stride0 = defaultStride0;
         OP_LOGD(context.GetNodeName(), "%s has no valid stride descriptor, use contiguous stride0=%lu.", tensorName,
