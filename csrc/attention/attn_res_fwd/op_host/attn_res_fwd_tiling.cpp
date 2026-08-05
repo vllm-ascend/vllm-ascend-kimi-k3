@@ -113,6 +113,7 @@ uint32_t AttnResFwdTiling::CalcMaxResidentRows(uint32_t hiddenSize) const
 {
     // UB ≈ B*H*2 + 4*H*4(scoreWeight/vRow/out/brc) + B*4 + 2*H*2(Que) + overhead (+ minStaging)
     // N_ub_max = floor( (UB - 4*H*4 - 2*H*2 - overhead - minStaging) / (H*2 + 4) )
+    // 保持保守估计，避免误选 RESIDENT（大 H 下 B 稍大即可能 UB 打满/精度异常）
     if (hiddenSize == 0) {
         return 0;
     }
@@ -139,6 +140,7 @@ uint64_t AttnResFwdTiling::EstimateUbComputeBytes(bool resident) const
     const uint32_t B = tilingData_.blockCount;
     const uint32_t HAlignBf16 = AlignUpU32(H, ELEM_PER_BLK_BF16);
     const uint32_t HAlignFp32 = AlignUpU32(H, ELEM_PER_BLK_FP32);
+    // 与 arch22 / kernel 一致：meta 按 32B block（8 fp32）对齐
     const uint32_t metaAlign = AlignUpU32(B, ELEM_PER_BLK_FP32);
 
     uint64_t ub = 0;
@@ -151,13 +153,13 @@ uint64_t AttnResFwdTiling::EstimateUbComputeBytes(bool resident) const
         ub += static_cast<uint64_t>(1) * HAlignBf16 * sizeof(uint16_t); // outQue
     }
     ub += static_cast<uint64_t>(3) * HAlignFp32 * sizeof(float); // scoreWeight + vRow + outFp32
-    ub += static_cast<uint64_t>(metaAlign) * sizeof(float);      // vecMeta
-    ub += static_cast<uint64_t>(metaAlign) * sizeof(float);      // metaSoftmax
-    ub += static_cast<uint64_t>(metaAlign) * ELEM_PER_BLK_FP32 * sizeof(float); // metaBrc
+    ub += static_cast<uint64_t>(metaAlign) * sizeof(float); // vecMeta
+    ub += static_cast<uint64_t>(metaAlign) * sizeof(float); // metaSoftmax
+    ub += static_cast<uint64_t>(metaAlign) * ELEM_PER_BLK_FP32 * sizeof(float); // metaBrc[n*8] after Softmax Brcb
     ub += static_cast<uint64_t>(SCALAR_LOCAL_ELEMS) * sizeof(float);
     if (tilingData_.needBackward != 0) {
         ub += static_cast<uint64_t>(ELEM_PER_BLK_FP32) * sizeof(float); // invQue_ 1 block
-        ub += static_cast<uint64_t>(metaAlign) * sizeof(float);         // probsQue_ AlignUp(B,8)
+        ub += static_cast<uint64_t>(metaAlign) * sizeof(float);         // probsQue_ AlignUp(B, 8)
     }
     ub += UB_OVERHEAD_BYTES;
     return ub;
