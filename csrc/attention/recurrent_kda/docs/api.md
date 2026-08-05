@@ -52,7 +52,7 @@ Shape 符号统一引用 [KDA 模型符号表](../../README.md#model-shape-symbo
 | `allow_neg_eigval` | bool | `false` | `{false, true}` | beta sigmoid 后是否乘 2 |
 | `safe_gate` | bool | `false` | `{false, true}` | raw gate 的 safe 分支 |
 | `lower_bound` | float? | `-5.0` | `[-5,0)` when `safe_gate=True` | safe gate 下界 |
-| `state_v_first` | bool | `true` | 当前必须为 `true` | 状态布局为 `[state_capacity,H_v,V,K]` |
+| `state_v_first` | bool | `true` | `{false, true}` | true 为 `[state_capacity,H_v,V,K]`，false 为 `[state_capacity,H_v,K,V]`；Kimi Torch 入口固定 true |
 
 ## 3. aclnn API
 
@@ -165,22 +165,22 @@ recurrent_kda<<<blockDim, nullptr, stream>>>(
     aLog, dtBias, numAcceptedTokens, out, finalState, workspace, tiling);
 ```
 
-直调通路只作为 route/诊断入口；公开 Python 和 aclnn API 负责完整参数校验。直调通路按连续物理
-布局解释 GM 地址，非连续 state 需要先由调用侧连续化。
+直调通路只作为 route/诊断入口；公开 Python 和 aclnn API 负责完整参数校验。kernel 按 tiling data
+中的 state stride 解释 GM 地址；非连续直调必须使用与实际 view 匹配的 host tiling 结果。
 
 ## 6. 已知限制
 
 - `q/k/v/out` 当前仅支持 BF16。
 - `K/V` 当前仅支持 `K=128,V=128` 或 `K=128,V=256` 两档枚举。
-- `_C_ascend` 入口支持非连续 `initial_state`，并保持原 tensor 的原位更新与 alias 语义。
+- `_C_ascend`/aclnn 入口支持符合 stride 约束的非连续 `initial_state`，并保持原 tensor 的原位更新与 alias 语义；仅允许 slot/head 外层维存在间隔，内部二维矩阵必须行主序稠密且外层地址区间不得重叠。
 - 所有活跃 slot 必须位于 `[0,state_capacity)`，且不同活跃序列不得共享正在写入的槽。
 - 空序列不读取 `ssm_state_indices/num_accepted_tokens`，也不读写 state pool。
 - `cu_seqlens` 必传，首项必须为 0，offset 必须单调不减，末项为有效 token 数且不得超过输入
   token capacity；相邻差值为序列长度。值约束由 device kernel 检查。
-- Ascend C `<<<>>>` 直调入口要求 state 为连续物理布局。
+- Ascend C `<<<>>>` 直调入口处理非连续 state 时，tiling data 必须携带与实际 view 一致的 stride。
 - 每条 recurrent 有效序列长度必须 `<=8`。
 - 仅支持 `layout="BSND"` 和 `layout="TND"`。
-- 仅支持 `state_v_first=True`。
+- Kimi Torch 入口固定 `state_v_first=True`；底层 aclnn/kernel 支持 V-first 与 K-first。
 - `use_gate_in_kernel=false` 时 `A_log/dt_bias/safe_gate` 必须为空或 false。
 
 ## 7. 异常与返回码

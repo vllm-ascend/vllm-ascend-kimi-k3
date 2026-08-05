@@ -22,24 +22,30 @@ def test_recurrent_kda_uses_vllm_ascend_apache_headers():
         assert "CANN Open Software License Agreement" not in source, path
 
 
-def test_aclnn_uses_device_cu_seqlens_and_mutable_state():
+def test_aclnn_uses_device_cu_seqlens_and_aliased_state_output():
     header = _read(OP_ROOT / "op_host/op_api/aclnn_recurrent_kda.h")
     l0_source = _read(OP_ROOT / "op_host/op_api/recurrent_kda.cpp")
 
-    assert "aclTensor *stateRef" in header
-    assert "const aclTensor *cuSeqlens" in header
+    assert "const aclTensor *initialStateRef" in header
+    assert "const aclTensor *cuSeqlensOptional" in header
     assert "aclIntArray" not in header
-    assert "const aclTensor *finalState" not in header
-    assert "OP_OUTPUT(out, stateRef)" in l0_source
+    assert "const aclTensor *finalState" in header
+    assert "OP_OUTPUT(attnOut, initialStateRef, finalState)" in l0_source
 
 
-def test_tiling_processor_owns_context_and_supports_2d_slots():
+def test_tiling_processor_owns_context_and_supports_strided_state():
     source = _read(OP_ROOT / "op_host/recurrent_kda_tiling_processor.h")
+    tiling = _read(OP_ROOT / "op_host/recurrent_kda_tiling.cpp")
 
     assert "RecurrentKdaTilingContext ctx_;" in source
     assert "const RecurrentKdaTilingContext &ctx_;" not in source
     assert "speculative [seq_num,max_step]" in source
     assert "ssmStateStride" in source
+    assert "GetInputStride(STATE_INDEX)" in tiling
+    assert "GetOutputStride(stateOutputIndex)" in tiling
+    assert "stateInStrides" in source
+    assert "stateOutStrides" in source
+    assert "outer strides overlap state rows or heads" in source
 
 
 def test_kernel_skips_empty_sequences_before_state_metadata_access():
@@ -47,7 +53,7 @@ def test_kernel_skips_empty_sequences_before_state_metadata_access():
 
     empty_skip = source.index("if (seqLen64 == 0)")
     slot_validation = source.index("ValidateStateSlots(batch_i, seq0, seqLen)")
-    state_prefetch = source.index("PrefetchState(nextStateOffset, nextSingleV)")
+    state_prefetch = source.index("PrefetchState(stateSlot, head_i, 0, nextSingleV)")
     assert empty_skip < slot_validation < state_prefetch
     assert "batchIdx * ssmStateStride_" in source
     assert "stateSlot >= static_cast<int64_t>(stateCapacity_)" in source
@@ -61,19 +67,34 @@ def test_cu_seqlens_uses_fla_prefix_sum_semantics():
 
     for kernel_path in kernel_paths:
         source = _read(kernel_path)
-        assert "int64_t seq0 = cuSeqlensGm_.GetValue(batch_i)" in source
-        assert "int64_t seq1 = cuSeqlensGm_.GetValue(batch_i + 1)" in source
+        assert "int64_t seq0 = SequenceStart(batch_i)" in source
+        assert "int64_t seq1 = SequenceEnd(batch_i)" in source
         assert "int64_t seqLen64 = seq1 - seq0" in source
+        assert "return hasCuSeqlens_ ? LoadCuSeqlens(batchIdx)" in source
+        assert "return hasCuSeqlens_ ? LoadCuSeqlens(batchIdx + 1)" in source
         assert "if (seq0 != 0)" in source
         assert "return seq0 <= static_cast<int64_t>(T_)" in source
         assert "return seq0 == static_cast<int64_t>(T_)" not in source
 
 
-def test_kernel_uses_generated_state_dtype_macro():
-    source = _read(OP_ROOT / "op_kernel/recurrent_kda.cpp")
+def test_kernel_uses_real_state_strides_and_generated_dtype_macro():
+    entry = _read(OP_ROOT / "op_kernel/recurrent_kda.cpp")
+    assert "DTYPE_INITIAL_STATE" in entry
+    assert "DTYPE_STATE" not in entry
 
-    assert "DTYPE_STATE" in source
-    assert "DTYPE_INITIAL_STATE" not in source
+    for kernel_path in (
+        OP_ROOT / "op_kernel/recurrent_kda.h",
+        OP_ROOT / "op_kernel/arch35/recurrent_kda.h",
+    ):
+        source = _read(kernel_path)
+        assert "stateInStride0_" in source
+        assert "stateInStride1_" in source
+        assert "stateInStride2_" in source
+        assert "stateInStride3_" in source
+        assert "stateOutStride0_" in source
+        assert "stateOutStride1_" in source
+        assert "stateOutStride2_" in source
+        assert "stateOutStride3_" in source
 
 
 def test_arch35_kernel_has_dedicated_micro_api_implementation():
@@ -94,7 +115,10 @@ def test_torch_binding_preserves_mutation_and_accepts_tnd():
     assert 'const char* layout = is_tnd ? "TND" : "BSND";' in adapter
     assert "        layout," in adapter
     assert "speculative [seq_num,max_step]" in adapter
-    assert "at::Tensor final_state = initial_state" in adapter
+    assert "at::Tensor final_state = at::empty_like(initial_state)" in adapter
+    assert "bool inplace_final_state = true" in adapter
+    assert "k_dim == 128 && (v_dim == 128 || v_dim == 256)" in adapter
+    assert "        final_state);" in adapter
     assert "Tensor(a!) initial_state" in schema
     assert "Tensor cu_seqlens" in schema
     assert "-> Tensor output" in schema
