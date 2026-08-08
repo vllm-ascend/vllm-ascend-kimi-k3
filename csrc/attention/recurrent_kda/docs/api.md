@@ -24,9 +24,9 @@ Shape 符号统一引用 [KDA 模型符号表](../../README.md#model-shape-symbo
 | `v` | 必选 | `BSND=[B,T,H_v,V]` 或 `TND=[T,H_v,V]` | BF16 | BSND/TND | value |
 | `g` | 必选 | `BSND=[B,T,H_v,K]` 或 `TND=[T,H_v,K]` | FP32/BF16/FP16 | BSND/TND | 预计算 step log gate 或 raw gate |
 | `beta` | 必选 | `BSND=[B,T,H_v]` 或 `TND=[T,H_v]` | FP32/BF16/FP16 | BSND/TND | delta 更新系数 |
-| `initial_state` | 必选 | `[state_capacity,H_v,V,K]` | FP32/BF16 | ND | 可变 state pool；命中槽原位更新 |
+| `initial_state` | Python 可选，aclnn/legacy 必选 | V-first `[state_capacity,H_v,V,K]` 或 K-first `[state_capacity,H_v,K,V]` | FP32/BF16 | ND | 可变 state pool；Python 入口为空时创建 `[seq_num,...]` 全零 FP32 状态 |
 | `cu_seqlens` | 必选 | `[seq_num+1]` | INT32/INT64 | ND | fla-org 累积 offset；首项为 0，末项为有效 packed token 数且不超过输入 token capacity，相邻差值为各序列长度 |
-| `ssm_state_indices` | 必选 | packed `[>=T]` 或 speculative `[seq_num,max_step]` | INT32/INT64 | ND | 每个 token 对应的 state pool 槽索引 |
+| `ssm_state_indices` | 可选 | packed `[>=T]` 或 speculative `[seq_num,max_step]` | INT32/INT64 | ND | 每个 token 对应的 state pool 槽索引 |
 | `A_log` | 条件必选 | `[H_v]` | FP32 | ND | `use_gate_in_kernel=True` 时必选 |
 | `dt_bias` | 可选 | `[H_v*K]` 或 `[H_v,K]` | FP32 | ND | raw gate 偏置 |
 | `num_accepted_tokens` | 可选 | `[seq_num]` | INT32/INT64 | ND | 必须与 `ssm_state_indices` 一起传 |
@@ -35,9 +35,8 @@ Shape 符号统一引用 [KDA 模型符号表](../../README.md#model-shape-symbo
 
 | 名称 | Shape | Dtype | 说明 |
 | --- | --- | --- | --- |
-| `out` | 与 `v` 相同 | BF16 | recurrent 输出；当有效 token 数小于 capacity 时，padding tail 不作保证 |
-
-`initial_state` 是可变输入：命中槽位原地更新，未命中槽位保持不变，不作为独立 alias 输出返回。
+| `out` | 与 `v` 相同 | BF16 | recurrent 输出 |
+| `final_state` | 与 `initial_state` 同 shape/dtype | FP32/BF16 | 原位模式与输入 alias；非原位模式为独立输出；`output_final_state=False` 时 Python 主入口不返回 state |
 
 ### 2.3 属性
 
@@ -45,14 +44,15 @@ Shape 符号统一引用 [KDA 模型符号表](../../README.md#model-shape-symbo
 | --- | --- | --- | --- | --- |
 | `layout` | str | `BSND` | `{"BSND", "TND"}` | 输入布局 |
 | `scale` | float? | Python/legacy 为 `K ** -0.5` | 任意有限浮点 | 乘到 query 上 |
-| `output_final_state` | bool | `false` | `{false, true}` | 兼容属性；state 始终通过 `stateRef` 原地更新，不产生独立输出 |
+| `output_final_state` | bool | `false` | `{false, true}` | Python 主入口是否返回最终状态；legacy Torch 入口不暴露该属性 |
+| `inplace_final_state` | bool | `true` | `{false, true}` | 是否把最终状态写回 `initial_state` |
 | `use_qk_l2norm_in_kernel` | bool | `false` | `{false, true}` | 是否在 kernel 内对 q/k 做 L2 normalize |
 | `use_gate_in_kernel` | bool | `false` | `{false, true}` | 是否把 `g` 解释为 raw gate |
 | `use_beta_sigmoid_in_kernel` | bool | `false` | `{false, true}` | 是否在 kernel 内计算 `sigmoid(beta)` |
 | `allow_neg_eigval` | bool | `false` | `{false, true}` | beta sigmoid 后是否乘 2 |
 | `safe_gate` | bool | `false` | `{false, true}` | raw gate 的 safe 分支 |
 | `lower_bound` | float? | `-5.0` | `[-5,0)` when `safe_gate=True` | safe gate 下界 |
-| `state_v_first` | bool | `true` | 当前必须为 `true` | 状态布局为 `[state_capacity,H_v,V,K]` |
+| `state_v_first` | bool | `true` | `{false, true}` | true 为 `[state_capacity,H_v,V,K]`，false 为 `[state_capacity,H_v,K,V]`；Kimi Torch 入口固定 true |
 
 ## 3. aclnn API
 
@@ -65,7 +65,7 @@ aclnnStatus aclnnRecurrentKdaGetWorkspaceSize(
     const aclTensor *value,
     const aclTensor *gate,
     const aclTensor *beta,
-    aclTensor *stateRef,
+    aclTensor *initialStateRef,
     const aclTensor *cuSeqlens,
     const aclTensor *ssmStateIndicesOptional,
     const aclTensor *aLogOptional,
@@ -74,6 +74,7 @@ aclnnStatus aclnnRecurrentKdaGetWorkspaceSize(
     const char *layout,
     double scale,
     bool outputFinalState,
+    bool inplaceFinalState,
     bool useQkL2normInKernel,
     bool useGateInKernel,
     bool useBetaSigmoidInKernel,
@@ -81,18 +82,20 @@ aclnnStatus aclnnRecurrentKdaGetWorkspaceSize(
     bool safeGate,
     double lowerBound,
     bool stateVFirst,
-    const aclTensor *out,
+    const aclTensor *attnOut,
+    const aclTensor *finalState,
     uint64_t *workspaceSize,
     aclOpExecutor **executor);
 
 aclnnStatus aclnnRecurrentKda(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream);
 ```
 
-`GetWorkspaceSize` 完成参数校验、连续化/cast 预处理和 executor 创建；第二段在传入 stream 上异步执行。
-`stateRef` 同时是输入和输出。非连续 state 使用临时连续 tensor 执行，再通过 `ViewCopy` 回写原 view。
-`cuSeqlens` 仅在 host 检查 rank/dtype，具体 offset 值由 device kernel 读取，兼容 ACLGraph replay。
-首项必须为 0，offset 必须单调不减，末项表示有效 token 数且不得超过输入 token capacity，相邻差值为各序列长度。
-末项小于 capacity 时，kernel 仅处理有效前缀并逐行跳过零长度序列；padding tail 输出不作保证。
+`GetWorkspaceSize` 完成参数校验、必要的非 state tensor 连续化/cast 预处理和 executor 创建；第二段在传入
+stream 上异步执行。非连续 state 通过 `CreateView` 保留 shape、storage、stride 和 offset，kernel 按 tiling
+中的真实 stride 直接访问。原位模式直接写回输入 view；非原位模式直接写入 `finalState` view。原位模式若调用者
+另外传入独立的 `finalState` 输出，仅为该输出保留一次必要的 `ViewCopy`。`cuSeqlens` 仅在 host 检查 rank/dtype，具体 offset 值由
+device kernel 读取，因而可在 ACLGraph capture/replay 中变化。首项必须为 0，offset 必须单调不减，末项必须等于
+输入 token 总数，且每个相邻 offset 的差值不超过 8。
 输入、输出、workspace 和 executor 必须保持有效，直到 stream 完成。
 
 ### 3.2 调用示例
@@ -104,7 +107,7 @@ aclOpExecutor *executor = nullptr;
 ACLNN_CHECK(aclnnRecurrentKdaGetWorkspaceSize(
     q, k, v, g, beta, state, cuSeqlens, ssmStateIndices,
     aLog, dtBias, numAcceptedTokens, "BSND", scale, true, true, true,
-    true, false, false, -5.0, true, out,
+    true, true, false, false, -5.0, true, out, finalState,
     &workspaceSize, &executor));
 void *workspace = nullptr;
 if (workspaceSize != 0) {
@@ -165,22 +168,22 @@ recurrent_kda<<<blockDim, nullptr, stream>>>(
     aLog, dtBias, numAcceptedTokens, out, finalState, workspace, tiling);
 ```
 
-直调通路只作为 route/诊断入口；公开 Python 和 aclnn API 负责完整参数校验。直调通路按连续物理
-布局解释 GM 地址，非连续 state 需要先由调用侧连续化。
+直调通路只作为 route/诊断入口；公开 Python 和 aclnn API 负责完整参数校验。kernel 按 tiling data
+中的 state stride 解释 GM 地址；非连续直调必须使用与实际 view 匹配的 host tiling 结果。
 
 ## 6. 已知限制
 
 - `q/k/v/out` 当前仅支持 BF16。
 - `K/V` 当前仅支持 `K=128,V=128` 或 `K=128,V=256` 两档枚举。
-- `_C_ascend` 入口支持非连续 `initial_state`，并保持原 tensor 的原位更新与 alias 语义。
+- `_C_ascend`/aclnn 入口支持符合 stride 约束的非连续 `initial_state`，并保持原 tensor 的原位更新与 alias 语义；仅允许 slot/head 外层维存在间隔，内部二维矩阵必须行主序稠密且外层地址区间不得重叠。
 - 所有活跃 slot 必须位于 `[0,state_capacity)`，且不同活跃序列不得共享正在写入的槽。
 - 空序列不读取 `ssm_state_indices/num_accepted_tokens`，也不读写 state pool。
 - `cu_seqlens` 必传，首项必须为 0，offset 必须单调不减，末项为有效 token 数且不得超过输入
   token capacity；相邻差值为序列长度。值约束由 device kernel 检查。
-- Ascend C `<<<>>>` 直调入口要求 state 为连续物理布局。
+- Ascend C `<<<>>>` 直调入口处理非连续 state 时，tiling data 必须携带与实际 view 一致的 stride。
 - 每条 recurrent 有效序列长度必须 `<=8`。
 - 仅支持 `layout="BSND"` 和 `layout="TND"`。
-- 仅支持 `state_v_first=True`。
+- Kimi Torch 入口固定 `state_v_first=True`；底层 aclnn/kernel 支持 V-first 与 K-first。
 - `use_gate_in_kernel=false` 时 `A_log/dt_bias/safe_gate` 必须为空或 false。
 
 ## 7. 异常与返回码

@@ -18,7 +18,7 @@ GDN recurrent 的函数接口。
 
 ### 2.2 非目标
 
-- 不支持 `state_v_first=False`。
+- Kimi Torch 入口固定 `state_v_first=True`；底层 aclnn/kernel 支持 `state_v_first=False`。
 - 不支持把 `KdaGateCumsum` 的输出流水作为公开前置步骤。
 - 不在本 PR 扩展长序列 chunk recurrent；每条 recurrent 序列长度当前限制为 `<=8`。
 
@@ -37,7 +37,7 @@ GDN recurrent 的函数接口。
 | Gate/Beta dtype | FP32/BF16/FP16，aclnn 预处理为 FP32 |
 | State dtype | FP32/BF16 |
 | Gate 模式 | 预计算 step log gate；kernel 内 raw gate |
-| State layout | `state_v_first=True`，`[state_capacity,H_v,V,K]` |
+| State layout | Kimi Torch 固定 V-first；底层 aclnn/kernel 支持 `[state_capacity,H_v,V,K]` 与 `[state_capacity,H_v,K,V]` |
 
 ## 4. 数学与接口语义
 
@@ -173,6 +173,7 @@ Q/K/V 公开输入为 BF16，gate/beta 在 aclnn 预处理后以 FP32 进入 ker
 - TND 预计算 log gate + 空 initial_state。
 - Kimi/KDA 关键泛化 shape：GVA head 映射、`K=128,V=128` dense raw gate、`K=128,V=256` TND safe gate。
 - Kimi K3 TP16：本地 head 数 6、`K=V=128`、BF16 Q/K/V、raw+safe gate、BSND decode/MTP 1-8；
+  增加带额外 layer 维的非连续 state pool，覆盖真实 stride 原位更新、未命中 slot 与相邻 layer 保护。
   覆盖普通单 token decode、`[0,1,4,4,5]` 非等长序列、二维 slot 索引、容量化 state pool 和未命中槽保持不变。
 - Kimi H96/D128 smoke：`H=H_v=96,K=V=128,safe_gate=True`，运行时生成 `cu_seqlens`，
   覆盖其长度和值泛化；每段 recurrent 长度仍遵循当前 `<=8` 限制。
@@ -196,6 +197,6 @@ A2/A5 精度验证过程中修复以下问题：
 - 当前仅支持 BF16 QKV。
 - 当前 `K/V` 仅支持 `K=128,V=128` 或 `K=128,V=256`。
 - 当前每段 recurrent 序列长度限制为 `<=8`。
-- 当前仅支持 `state_v_first=True`。
+- Kimi Torch 入口固定 `state_v_first=True`；底层 aclnn/kernel 同时支持 V-first 与 K-first。
 - 显式 slot 模式要求所有活跃写槽互不冲突，且 slot 值位于 state pool 容量范围内。
 - 后续若扩展长序列或更多 dtype，需要同步更新 op_host 校验、tiling、kernel、JSON case 和 API 文档。
