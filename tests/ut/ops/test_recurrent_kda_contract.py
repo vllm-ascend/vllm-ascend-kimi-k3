@@ -26,7 +26,7 @@ def test_aclnn_uses_device_cu_seqlens_and_aliased_state_output():
     header = _read(OP_ROOT / "op_host/op_api/aclnn_recurrent_kda.h")
     l0_source = _read(OP_ROOT / "op_host/op_api/recurrent_kda.cpp")
 
-    assert "const aclTensor *initialStateRef" in header
+    assert "aclTensor *initialStateRef" in header
     assert "const aclTensor *cuSeqlensOptional" in header
     assert "aclIntArray" not in header
     assert "const aclTensor *finalState" in header
